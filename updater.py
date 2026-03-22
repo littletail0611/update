@@ -12,12 +12,20 @@ class UnifiedConfidenceUpdater:
         self.args = args
         self.ablation_mode = ablation_mode
 
-        # 维持底层规则（MLP 和 关系投影）绝对冻结
+        # Freeze MLP and relation embeddings
         for param in self.model.mlp_mean.parameters():
             param.requires_grad = False
         for param in self.model.mlp_var.parameters():
             param.requires_grad = False
         self.model.relation_emb.weight.requires_grad = False
+
+        # Pre-index inc_valid facts by relation for EM calibration
+        self.valid_by_rel = {}
+        for fact in dataset.inc_valid:
+            r = fact[1]
+            if r not in self.valid_by_rel:
+                self.valid_by_rel[r] = []
+            self.valid_by_rel[r].append(fact)
 
     def step(self, new_facts_batch):
         h_idx = torch.tensor([f[0] for f in new_facts_batch], dtype=torch.long, device=self.device)
@@ -111,11 +119,13 @@ class UnifiedConfidenceUpdater:
 
         em_steps = self.args.em_steps if self.args else 5
         lambda_reg = self.args.lambda_reg if self.args else 0.001
+        # Cap lambda_reg to prevent over-restriction in EM stage
+        lambda_reg = min(lambda_reg, 0.01)
 
         old_emb_snapshot = self.model.entity_emb.weight.detach().clone()
         base_num_ent = self.dataset.base_num_ent
 
-        # 宏观校准：只看旧知识中该关系的平均置信度
+        # Relation prior from base knowledge
         rel_priors = []
         for r in r_idx:
             mask = (base_edge_type == r)
@@ -126,7 +136,7 @@ class UnifiedConfidenceUpdater:
 
         prior_conf = torch.tensor(rel_priors, dtype=torch.float, device=self.device)
 
-        # 微观校准：依靠 GNN 跑一次零样本前向，获取拓扑推断
+        # Zero-shot forward
         self.model.eval()
         with torch.no_grad():
             init_combined_conf = torch.cat([base_edge_conf, prior_conf], dim=0)
@@ -138,37 +148,58 @@ class UnifiedConfidenceUpdater:
 
         momentum = 0.8
 
+        # Pre-collect calibration anchors from inc_valid for current batch relations
+        cal_h, cal_r, cal_t, cal_c = [], [], [], []
+        for r_val in r_idx.unique().tolist():
+            if r_val in self.valid_by_rel:
+                for fact in self.valid_by_rel[r_val][:16]:  # Cap at 16 per relation to limit compute cost while providing enough signal
+                    cal_h.append(fact[0])
+                    cal_r.append(fact[1])
+                    cal_t.append(fact[2])
+                    cal_c.append(fact[3])
+
+        has_calibration = len(cal_h) > 0
+        if has_calibration:
+            cal_h_t = torch.tensor(cal_h, dtype=torch.long, device=self.device)
+            cal_r_t = torch.tensor(cal_r, dtype=torch.long, device=self.device)
+            cal_t_t = torch.tensor(cal_t, dtype=torch.long, device=self.device)
+            cal_c_t = torch.tensor(cal_c, dtype=torch.float, device=self.device)
+
+        # Constant replay scale: moderate value prevents new knowledge suppression (too high)
+        # and avoids EM later steps being completely stuck (escalating scale)
+        replay_scale = 0.5
+
         for step in range(em_steps):
             optimizer.zero_grad()
             curr_z = self.model.entity_emb.weight
 
-            # 使用 target_conf 作为输入，让 GNN 带着这个"初步信念"去聚合邻居
             combined_edge_conf = torch.cat([base_edge_conf, target_conf], dim=0)
             updated_z = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
 
             mu_pred, sigma_pred = self.model.predict(updated_z[h_idx], r_idx, updated_z[t_idx])
 
-            # EMA 缓慢放权：稳扎稳打，并保持关系先验的锚定
+            # Single EMA, no secondary prior mixing
             with torch.no_grad():
-                teacher_conf = momentum * target_conf + (1.0 - momentum) * mu_pred.detach()
-                target_conf = 0.9 * teacher_conf + 0.1 * prior_conf
+                target_conf = momentum * target_conf + (1.0 - momentum) * mu_pred.detach()
 
-            # (1) 异方差伪标签损失：只拟合自己，绝不与其他不确定的新事实乱攀比
+            # (1) Heteroscedastic pseudo-label loss
             loss_pseudo = torch.mean(((target_conf - mu_pred) ** 2) / (sigma_pred + 1e-6) + torch.log(sigma_pred + 1e-6))
 
-            # (2) 旧知识保护机制 (Replay Loss)：方差越大，惩罚越小
-            mu_base_pred, sigma_base_pred = self.model.predict(updated_z[base_edge_idx[0]], base_edge_type, updated_z[base_edge_idx[1]])
-            weight = base_edge_conf.detach() / (sigma_base_pred.detach() + 1e-4)
-            weighted_squared_error = weight * (mu_base_pred - base_edge_conf) ** 2
-            loss_replay = torch.sum(weighted_squared_error) / (torch.sum(weight) + 1e-8)
+            # (2) Simplified per-edge replay loss (removed confidence/sigma weighting)
+            mu_base_pred, _ = self.model.predict(updated_z[base_edge_idx[0]], base_edge_type, updated_z[base_edge_idx[1]])
+            loss_replay = torch.mean((mu_base_pred - base_edge_conf) ** 2)
 
-            # (3) 弹性锚点正则：绝对物理限制
+            # (3) Embedding anchor regularization
             loss_reg = lambda_reg * torch.mean((curr_z[:base_num_ent] - old_emb_snapshot[:base_num_ent]) ** 2)
 
-            # 动态 Replay 权重：让旧知识的保护墙随着迭代逐渐变厚
-            replay_scale = 1.0 + (step / max(1, em_steps - 1))
+            # (4) Calibration loss from inc_valid ground truth anchors
+            if has_calibration:
+                mu_cal, _ = self.model.predict(updated_z[cal_h_t], cal_r_t, updated_z[cal_t_t])
+                loss_calibration = torch.mean((mu_cal - cal_c_t) ** 2)
+            else:
+                loss_calibration = torch.tensor(0.0, device=self.device)
 
-            loss_total = loss_pseudo + loss_reg + replay_scale * loss_replay
+            loss_total = loss_pseudo + loss_reg + replay_scale * loss_replay + loss_calibration
             loss_total.backward()
 
             torch.nn.utils.clip_grad_norm_(self.model.entity_emb.parameters(), max_norm=1.0)
@@ -230,6 +261,8 @@ class UnifiedConfidenceUpdater:
         """Elastic rebalancing: fit new knowledge + evolve affected old knowledge + elastic anchor"""
         threshold = self.args.influence_threshold if self.args else 0.01
         lambda_reg = self.args.lambda_reg if self.args else 0.001
+        # Cap lambda_reg to prevent over-restriction in refinement stage
+        lambda_reg = min(lambda_reg, 0.01)
         alpha = 1.0
         steps = self.args.refine_steps if self.args else 3
 
