@@ -6,12 +6,6 @@ import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import softmax
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.nn import MessagePassing
-from torch_geometric.utils import softmax
-
 class ConfidenceAwareGNNLayer(MessagePassing):
     def __init__(self, emb_dim):
         super(ConfidenceAwareGNNLayer, self).__init__(aggr='add')
