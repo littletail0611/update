@@ -12,18 +12,9 @@ class UnifiedConfidenceUpdater:
         self.args = args
         self.ablation_mode = ablation_mode
 
-        # Save snapshot of MLP params for anchor regularization
-        self.old_mlp_params = {}
-        for name, param in self.model.mlp_mean.named_parameters():
-            self.old_mlp_params[name] = param.detach().clone()
-
-        # Freeze most params but allow last linear layer of mlp_mean to adapt
-        for name, param in self.model.mlp_mean.named_parameters():
-            if name.startswith('3.'):  # The last nn.Linear(emb_dim, 1) at Sequential index 3
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
-
+        # 维持底层规则（MLP 和 关系投影）绝对冻结
+        for param in self.model.mlp_mean.parameters():
+            param.requires_grad = False
         for param in self.model.mlp_var.parameters():
             param.requires_grad = False
         self.model.relation_emb.weight.requires_grad = False
@@ -111,10 +102,8 @@ class UnifiedConfidenceUpdater:
                         ent_weight[ent_id] = ent_weight[neighbor_tensor].mean(dim=0)
 
     def _local_em_inference(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf):
-        trainable_params = [self.model.entity_emb.weight]
-        trainable_params += [p for p in self.model.mlp_mean.parameters() if p.requires_grad]
         self.model.train()
-        optimizer = optim.Adam(trainable_params, lr=self.lr)
+        optimizer = optim.Adam([self.model.entity_emb.weight], lr=self.lr)
 
         new_edge_index = torch.stack([h_idx, t_idx], dim=0)
         combined_edge_index = torch.cat([base_edge_idx, new_edge_index], dim=1)
@@ -126,7 +115,7 @@ class UnifiedConfidenceUpdater:
         old_emb_snapshot = self.model.entity_emb.weight.detach().clone()
         base_num_ent = self.dataset.base_num_ent
 
-        # Macroscopic calibration: relation prior from base knowledge
+        # 宏观校准：只看旧知识中该关系的平均置信度
         rel_priors = []
         for r in r_idx:
             mask = (base_edge_type == r)
@@ -137,70 +126,49 @@ class UnifiedConfidenceUpdater:
 
         prior_conf = torch.tensor(rel_priors, dtype=torch.float, device=self.device)
 
-        # P3: Adaptive prior/zero-shot mixing based on uncertainty
+        # 微观校准：依靠 GNN 跑一次零样本前向，获取拓扑推断
         self.model.eval()
         with torch.no_grad():
             init_combined_conf = torch.cat([base_edge_conf, prior_conf], dim=0)
             init_z = self.model(combined_edge_index, combined_edge_type, init_combined_conf)
-            mu_zero_shot, sigma_zero_shot = self.model.predict(init_z[h_idx], r_idx, init_z[t_idx])
+            mu_zero_shot, _ = self.model.predict(init_z[h_idx], r_idx, init_z[t_idx])
 
-        # confidence_weight ∈ (0,1): weight applied to the zero-shot prediction.
-        # When sigma_zero_shot is high (high uncertainty), confidence_weight → 0,
-        # so target_conf relies more on the stable relation prior (prior_conf).
-        confidence_weight = 1.0 / (1.0 + sigma_zero_shot.detach())
-        target_conf = (1 - confidence_weight) * prior_conf + confidence_weight * mu_zero_shot.detach()
+        target_conf = 0.6 * prior_conf + 0.4 * mu_zero_shot.detach()
         self.model.train()
 
-        # P2: Identify entities in new facts for local replay
-        new_ent_set = set(h_idx.tolist() + t_idx.tolist())
-        replay_mask = torch.tensor(
-            [(base_edge_idx[0, i].item() in new_ent_set or base_edge_idx[1, i].item() in new_ent_set)
-             for i in range(base_edge_idx.shape[1])],
-            dtype=torch.bool, device=self.device
-        )
+        momentum = 0.8
 
         for step in range(em_steps):
-            # P1: Dynamic momentum: from 0.9 down to 0.3
-            curr_momentum = 0.9 - 0.6 * (step / max(1, em_steps - 1))
-
             optimizer.zero_grad()
             curr_z = self.model.entity_emb.weight
 
+            # 使用 target_conf 作为输入，让 GNN 带着这个"初步信念"去聚合邻居
             combined_edge_conf = torch.cat([base_edge_conf, target_conf], dim=0)
             updated_z = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
 
             mu_pred, sigma_pred = self.model.predict(updated_z[h_idx], r_idx, updated_z[t_idx])
 
+            # EMA 缓慢放权：稳扎稳打，并保持关系先验的锚定
             with torch.no_grad():
-                target_conf = curr_momentum * target_conf + (1 - curr_momentum) * mu_pred.detach()
+                teacher_conf = momentum * target_conf + (1.0 - momentum) * mu_pred.detach()
+                target_conf = 0.9 * teacher_conf + 0.1 * prior_conf
 
+            # (1) 异方差伪标签损失：只拟合自己，绝不与其他不确定的新事实乱攀比
             loss_pseudo = torch.mean(((target_conf - mu_pred) ** 2) / (sigma_pred + 1e-6) + torch.log(sigma_pred + 1e-6))
 
-            # P2: Local replay - only edges sharing entities with new facts
-            if replay_mask.any():
-                replay_edges = base_edge_idx[:, replay_mask]
-                replay_rels = base_edge_type[replay_mask]
-                replay_conf = base_edge_conf[replay_mask]
-                mu_base_pred, sigma_base_pred = self.model.predict(
-                    updated_z[replay_edges[0]], replay_rels, updated_z[replay_edges[1]])
-                weight = replay_conf.detach() / (sigma_base_pred.detach() + 1e-4)
-                weighted_squared_error = weight * (mu_base_pred - replay_conf) ** 2
-                loss_replay = torch.sum(weighted_squared_error) / (torch.sum(weight) + 1e-8)
-            else:
-                loss_replay = torch.tensor(0.0, device=self.device)
+            # (2) 旧知识保护机制 (Replay Loss)：方差越大，惩罚越小
+            mu_base_pred, sigma_base_pred = self.model.predict(updated_z[base_edge_idx[0]], base_edge_type, updated_z[base_edge_idx[1]])
+            weight = base_edge_conf.detach() / (sigma_base_pred.detach() + 1e-4)
+            weighted_squared_error = weight * (mu_base_pred - base_edge_conf) ** 2
+            loss_replay = torch.sum(weighted_squared_error) / (torch.sum(weight) + 1e-8)
 
+            # (3) 弹性锚点正则：绝对物理限制
             loss_reg = lambda_reg * torch.mean((curr_z[:base_num_ent] - old_emb_snapshot[:base_num_ent]) ** 2)
 
-            # P2: MLP anchor loss to protect old knowledge in MLP
-            mlp_anchor_coeff = getattr(self.args, 'mlp_anchor_coeff', 0.01) if self.args else 0.01
-            loss_mlp_anchor = mlp_anchor_coeff * sum(
-                ((p - self.old_mlp_params[n]) ** 2).mean()
-                for n, p in self.model.mlp_mean.named_parameters() if p.requires_grad
-            )
+            # 动态 Replay 权重：让旧知识的保护墙随着迭代逐渐变厚
+            replay_scale = 1.0 + (step / max(1, em_steps - 1))
 
-            # P2: Decreasing replay scale: protect old knowledge early, let new knowledge in later
-            replay_scale = 2.0 - (step / max(1, em_steps - 1))
-            loss_total = loss_pseudo + loss_reg + replay_scale * loss_replay + loss_mlp_anchor
+            loss_total = loss_pseudo + loss_reg + replay_scale * loss_replay
             loss_total.backward()
 
             torch.nn.utils.clip_grad_norm_(self.model.entity_emb.parameters(), max_norm=1.0)
@@ -273,9 +241,7 @@ class UnifiedConfidenceUpdater:
         real_affected_count = affected_mask.sum().item()
 
         self.model.train()
-        trainable_params = [self.model.entity_emb.weight]
-        trainable_params += [p for p in self.model.mlp_mean.parameters() if p.requires_grad]
-        optimizer = optim.Adam(trainable_params, lr=self.lr)
+        optimizer = optim.Adam([self.model.entity_emb.weight], lr=self.lr)
 
         for _ in range(steps):
             optimizer.zero_grad()
