@@ -1,0 +1,6 @@
+Model Variant,Inc Test MSE (↓),Inc Test MAE (↓),Base Test MSE (↓),Total Affected Edges,Time Cost (s)
+Ours (Full Model),0.0751,0.1953,0.0355,2650,53.4
+w/o Causal Filter,0.0733,0.1927,0.0369,7551880,53.5
+w/o Bayesian Filter,0.0745,0.1935,0.0355,2567,52.4
+w/o Global KD Protect,0.0744,0.1939,0.0356,2956,51.7
+w/o EM Base Freeze,0.0744,0.1931,0.0352,2694,51.0
