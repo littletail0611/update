@@ -82,9 +82,23 @@ def run_incremental_update(args):
     print("\n=== 所有增量更新任务执行完毕，执行最终全面评估 ===")
     
     # 5. 评估增量更新后的整体表现
+    # P0 Fix: Build combined graph including inc_train edges so new entities receive GNN messages
+    inc_train_facts = dataset.inc_train
+    if inc_train_facts:
+        inc_h = torch.tensor([f[0] for f in inc_train_facts], dtype=torch.long, device=args.device)
+        inc_r = torch.tensor([f[1] for f in inc_train_facts], dtype=torch.long, device=args.device)
+        inc_t = torch.tensor([f[2] for f in inc_train_facts], dtype=torch.long, device=args.device)
+        inc_c = torch.tensor([dataset.belief_state.get((f[0], f[1], f[2]), 0.5) for f in inc_train_facts],
+                              dtype=torch.float, device=args.device)
+        eval_edge_index = torch.cat([edge_index, torch.stack([inc_h, inc_t])], dim=1)
+        eval_edge_type = torch.cat([edge_type, inc_r])
+        eval_edge_conf = torch.cat([edge_conf, inc_c])
+    else:
+        eval_edge_index, eval_edge_type, eval_edge_conf = edge_index, edge_type, edge_conf
+
     model.eval()
     with torch.no_grad():
-        final_z = model(edge_index, edge_type, edge_conf)
+        final_z = model(eval_edge_index, eval_edge_type, eval_edge_conf)
     
     # 评估 1：增量更新后的新知识掌握情况 (模型有没有学到新东西)
     inc_test_metrics = evaluate_model(model, dataset.inc_test, z=final_z, device=args.device)
