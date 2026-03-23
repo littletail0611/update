@@ -33,6 +33,11 @@ def get_args():
     parser.add_argument("--lambda_reg", type=float, default=0.1, help="防止灾难性遗忘的锚点正则化权重")
     parser.add_argument("--refine_steps", type=int, default=3, help="受影响局部子图的微调步数")
 
+    # ================= 5. 一致性正则化超参数 =================
+    parser.add_argument("--edge_drop_rate", type=float, default=0.2, help="Edge dropout ratio for consistency regularization")
+    parser.add_argument("--alpha_base", type=float, default=1.0, help="Weight for base outer-constraint loss")
+    parser.add_argument("--mlp_anchor_coeff", type=float, default=0.01, help="MLP anchor regularization coefficient")
+
     args = parser.parse_args()
     return args
 

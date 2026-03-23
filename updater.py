@@ -19,6 +19,11 @@ class UnifiedConfidenceUpdater:
             param.requires_grad = False
         self.model.relation_emb.weight.requires_grad = False
 
+        # Unfreeze the last linear layer of mlp_mean so consistency regularization
+        # can fine-tune the prediction head without receiving noisy pseudo-label gradients
+        for param in self.model.mlp_mean[3].parameters():
+            param.requires_grad = True
+
         # Pre-index inc_valid facts by relation for EM calibration
         self.valid_by_rel = {}
         for fact in dataset.inc_valid:
@@ -47,8 +52,8 @@ class UnifiedConfidenceUpdater:
             # Save old raw embeddings for elastic anchor regularization
             old_raw_emb = self.model.entity_emb.weight.detach().clone()
 
-        # 1. EM inference stage
-        new_mu, new_sigma_sq = self._local_em_inference(h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf)
+        # 1. Consistency inference stage (replaces EM pseudo-label inference)
+        new_mu, new_sigma_sq = self._consistency_inference(h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf)
 
         # 2. Causal influence assessment
         S_tau, mu_with, sigma_sq_old = self._compute_causal_influence(base_edge_idx, base_edge_type, base_edge_conf, mu_without, h_idx, r_idx, t_idx, new_mu, new_sigma_sq)
@@ -109,23 +114,26 @@ class UnifiedConfidenceUpdater:
                         neighbor_tensor = torch.tensor(neighbors, dtype=torch.long, device=self.device)
                         ent_weight[ent_id] = ent_weight[neighbor_tensor].mean(dim=0)
 
-    def _local_em_inference(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf):
-        self.model.train()
-        optimizer = optim.Adam([self.model.entity_emb.weight], lr=self.lr)
+    def _consistency_inference(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf):
+        """Consistency regularization + Base outer constraint (replaces EM pseudo-label inference).
 
+        Instead of giving new facts a concrete pseudo-label target, we use two stochastic
+        views of the same graph (one clean, one with edge dropout) and minimise their
+        prediction discrepancy.  A base-GT constraint keeps the embeddings from drifting.
+        """
+        self.model.train()
+
+        # Collect trainable parameters: entity embeddings + unfrozen last layer of mlp_mean
+        trainable_params = [self.model.entity_emb.weight]
+        trainable_params += [p for p in self.model.mlp_mean.parameters() if p.requires_grad]
+        optimizer = optim.Adam(trainable_params, lr=self.lr)
+
+        # Build combined graph (base edges + new edges)
         new_edge_index = torch.stack([h_idx, t_idx], dim=0)
         combined_edge_index = torch.cat([base_edge_idx, new_edge_index], dim=1)
         combined_edge_type = torch.cat([base_edge_type, r_idx], dim=0)
 
-        em_steps = self.args.em_steps if self.args else 5
-        lambda_reg = self.args.lambda_reg if self.args else 0.001
-        # Cap lambda_reg to prevent over-restriction in EM stage
-        lambda_reg = min(lambda_reg, 0.01)
-
-        old_emb_snapshot = self.model.entity_emb.weight.detach().clone()
-        base_num_ent = self.dataset.base_num_ent
-
-        # Relation prior from base knowledge
+        # Initialize new-fact confidences using relation priors (GNN input only, NOT a loss target)
         rel_priors = []
         for r in r_idx:
             mask = (base_edge_type == r)
@@ -133,79 +141,105 @@ class UnifiedConfidenceUpdater:
                 rel_priors.append(base_edge_conf[mask].mean().item())
             else:
                 rel_priors.append(0.5)
-
         prior_conf = torch.tensor(rel_priors, dtype=torch.float, device=self.device)
+        combined_edge_conf = torch.cat([base_edge_conf, prior_conf], dim=0)
 
-        # Zero-shot forward
-        self.model.eval()
-        with torch.no_grad():
-            init_combined_conf = torch.cat([base_edge_conf, prior_conf], dim=0)
-            init_z = self.model(combined_edge_index, combined_edge_type, init_combined_conf)
-            mu_zero_shot, _ = self.model.predict(init_z[h_idx], r_idx, init_z[t_idx])
+        old_emb_snapshot = self.model.entity_emb.weight.detach().clone()
+        base_num_ent = self.dataset.base_num_ent
 
-        target_conf = 0.6 * prior_conf + 0.4 * mu_zero_shot.detach()
-        self.model.train()
+        # Snapshot unfrozen MLP parameters for anchor regularisation
+        old_mlp_params = {
+            name: param.detach().clone()
+            for name, param in self.model.mlp_mean.named_parameters()
+            if param.requires_grad
+        }
 
-        momentum = 0.8
+        # Identify base edges that share at least one entity with the new facts
+        # (used for the Base outer-constraint loss with GT confidences)
+        new_ents_tensor = torch.cat([h_idx, t_idx]).unique()
+        replay_mask = (
+            torch.isin(base_edge_idx[0], new_ents_tensor) |
+            torch.isin(base_edge_idx[1], new_ents_tensor)
+        )
 
-        # Pre-collect calibration anchors from inc_valid for current batch relations
-        cal_h, cal_r, cal_t, cal_c = [], [], [], []
-        for r_val in r_idx.unique().tolist():
-            if r_val in self.valid_by_rel:
-                for fact in self.valid_by_rel[r_val][:16]:  # Cap at 16 per relation to limit compute cost while providing enough signal
-                    cal_h.append(fact[0])
-                    cal_r.append(fact[1])
-                    cal_t.append(fact[2])
-                    cal_c.append(fact[3])
+        em_steps = self.args.em_steps if self.args else 5
+        lambda_reg = self.args.lambda_reg if self.args else 0.001
+        lambda_reg = min(lambda_reg, 0.01)
+        edge_drop_rate = getattr(self.args, 'edge_drop_rate', 0.2) if self.args else 0.2
+        alpha_base = getattr(self.args, 'alpha_base', 1.0) if self.args else 1.0
+        mlp_anchor_coeff = getattr(self.args, 'mlp_anchor_coeff', 0.01) if self.args else 0.01
 
-        has_calibration = len(cal_h) > 0
-        if has_calibration:
-            cal_h_t = torch.tensor(cal_h, dtype=torch.long, device=self.device)
-            cal_r_t = torch.tensor(cal_r, dtype=torch.long, device=self.device)
-            cal_t_t = torch.tensor(cal_t, dtype=torch.long, device=self.device)
-            cal_c_t = torch.tensor(cal_c, dtype=torch.float, device=self.device)
-
-        # Constant replay scale: moderate value prevents new knowledge suppression (too high)
-        # and avoids EM later steps being completely stuck (escalating scale)
-        replay_scale = 0.5
+        mu_v1 = sigma_v1 = None
 
         for step in range(em_steps):
             optimizer.zero_grad()
-            curr_z = self.model.entity_emb.weight
 
-            combined_edge_conf = torch.cat([base_edge_conf, target_conf], dim=0)
-            updated_z = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
+            # === View 1: normal forward on full combined graph ===
+            z_normal = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
+            mu_v1, sigma_v1 = self.model.predict(z_normal[h_idx], r_idx, z_normal[t_idx])
 
-            mu_pred, sigma_pred = self.model.predict(updated_z[h_idx], r_idx, updated_z[t_idx])
+            # === View 2: edge-dropped forward (stop gradient) ===
+            drop_mask = torch.rand(combined_edge_index.shape[1], device=self.device) > edge_drop_rate
+            # Ensure at least one edge survives to keep the GNN well-defined
+            if not drop_mask.any():
+                drop_mask = drop_mask.clone()
+                drop_mask[0] = True
+            dropped_edge_index = combined_edge_index[:, drop_mask]
+            dropped_edge_type = combined_edge_type[drop_mask]
+            dropped_edge_conf = combined_edge_conf[drop_mask]
 
-            # Single EMA, no secondary prior mixing
             with torch.no_grad():
-                target_conf = momentum * target_conf + (1.0 - momentum) * mu_pred.detach()
+                z_dropped = self.model(dropped_edge_index, dropped_edge_type, dropped_edge_conf)
+                mu_v2, _ = self.model.predict(z_dropped[h_idx], r_idx, z_dropped[t_idx])
 
-            # (1) Heteroscedastic pseudo-label loss
-            loss_pseudo = torch.mean(((target_conf - mu_pred) ** 2) / (sigma_pred + 1e-6) + torch.log(sigma_pred + 1e-6))
+            # (1) Consistency loss: View 1 chases View 2 (detached), no GT needed
+            loss_consistency = torch.mean((mu_v1 - mu_v2.detach()) ** 2)
 
-            # (2) Simplified per-edge replay loss (removed confidence/sigma weighting)
-            mu_base_pred, _ = self.model.predict(updated_z[base_edge_idx[0]], base_edge_type, updated_z[base_edge_idx[1]])
-            loss_replay = torch.mean((mu_base_pred - base_edge_conf) ** 2)
-
-            # (3) Embedding anchor regularization
-            loss_reg = lambda_reg * torch.mean((curr_z[:base_num_ent] - old_emb_snapshot[:base_num_ent]) ** 2)
-
-            # (4) Calibration loss from inc_valid ground truth anchors
-            if has_calibration:
-                mu_cal, _ = self.model.predict(updated_z[cal_h_t], cal_r_t, updated_z[cal_t_t])
-                loss_calibration = torch.mean((mu_cal - cal_c_t) ** 2)
+            # (2) Base outer-constraint loss: use GT confidences on shared-entity base edges
+            if replay_mask.any():
+                replay_edges = base_edge_idx[:, replay_mask]
+                replay_rels = base_edge_type[replay_mask]
+                replay_conf = base_edge_conf[replay_mask]
+                mu_base_pred, _ = self.model.predict(
+                    z_normal[replay_edges[0]], replay_rels, z_normal[replay_edges[1]]
+                )
+                loss_base = F.mse_loss(mu_base_pred, replay_conf)
             else:
-                loss_calibration = torch.tensor(0.0, device=self.device)
+                loss_base = torch.tensor(0.0, device=self.device)
 
-            loss_total = loss_pseudo + loss_reg + replay_scale * loss_replay + loss_calibration
+            # (3) Embedding anchor regularisation (prevent catastrophic forgetting)
+            curr_z = self.model.entity_emb.weight
+            loss_reg = lambda_reg * torch.mean(
+                (curr_z[:base_num_ent] - old_emb_snapshot[:base_num_ent]) ** 2
+            )
+
+            # (4) MLP anchor regularisation (keep unfrozen MLP head close to base model)
+            loss_mlp_anchor = torch.tensor(0.0, device=self.device)
+            for name, param in self.model.mlp_mean.named_parameters():
+                if param.requires_grad and name in old_mlp_params:
+                    loss_mlp_anchor = loss_mlp_anchor + torch.mean((param - old_mlp_params[name]) ** 2)
+            loss_mlp_anchor = mlp_anchor_coeff * loss_mlp_anchor
+
+            loss_total = loss_consistency + alpha_base * loss_base + loss_reg + loss_mlp_anchor
             loss_total.backward()
 
-            torch.nn.utils.clip_grad_norm_(self.model.entity_emb.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
 
-        return mu_pred, sigma_pred
+            # Dynamically refresh edge_conf for new facts using the updated model (optional)
+            with torch.no_grad():
+                z_updated = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
+                mu_updated, _ = self.model.predict(z_updated[h_idx], r_idx, z_updated[t_idx])
+                combined_edge_conf = torch.cat([base_edge_conf, mu_updated.detach()], dim=0)
+
+        # Fallback if em_steps == 0
+        if mu_v1 is None:
+            self.model.eval()
+            with torch.no_grad():
+                z = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
+                mu_v1, sigma_v1 = self.model.predict(z[h_idx], r_idx, z[t_idx])
+
+        return mu_v1.detach(), sigma_v1.detach()
 
     def _compute_causal_influence(self, base_edge_idx, base_edge_type, base_edge_conf, mu_without, h_idx, r_idx, t_idx, new_mu, new_sigma_sq):
         self.model.eval()
