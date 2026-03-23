@@ -1,7 +1,7 @@
 import argparse
 import torch
 
-def get_args():
+def get_args(argv=None):
     parser = argparse.ArgumentParser(description="UKG-Updater: Dynamic Confidence Updating")
 
     # ================= 1. 数据与环境配置 =================
@@ -43,7 +43,10 @@ def get_args():
     parser.add_argument("--dynamic_update_interval", type=int, default=2, help="Update pseudo-label every N finetune steps (0 to disable)")
     parser.add_argument("--func_anchor_ratio", type=float, default=0.9, help="Blend ratio for functional anchoring: func_anchor_ratio * functional_loss + (1 - func_anchor_ratio) * weak_absolute_L2")
 
-    args = parser.parse_args()
+    # ================= 6. 调参模式 =================
+    parser.add_argument("--tuning_mode", action="store_true", default=False, help="Enable tuning mode: suppresses verbose console output during hyperparameter search")
+
+    args = parser.parse_args(argv)
     return args
 
 if __name__ == "__main__":

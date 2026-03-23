@@ -79,6 +79,86 @@ python run_incremental.py
 
 * **Outputs**: Evaluates MSE/MAE for the new facts and measures the correction accuracy of the global belief state for old facts. Saves `checkpoints/final_belief_state.pt`.
 
+## 🔍 Hyperparameter Tuning
+
+The `tune_hyperparams.py` script provides automated hyperparameter search using either **Optuna Bayesian optimisation** or **exhaustive Grid Search**, organised into three sequential tuning stages.
+
+### Installation
+
+```bash
+pip install optuna   # required only for --mode optuna (Bayesian optimisation)
+                     # grid search mode works without any additional dependencies
+```
+
+### 3-Stage Tuning Strategy
+
+| Stage | Flag | Parameters tuned | Objective |
+|-------|------|-----------------|-----------|
+| **Base** | `--stage base` | `base_lr`, `dropout_rate`, `alpha_cl`, `num_layers`, `base_weight_decay` | Minimise Base Test MSE |
+| **Inc** | `--stage inc` | `inc_lr`, `lambda_reg`, `gamma`, `influence_threshold`, `refine_steps` | `Inc_MSE + 0.3 × Base_MSE` |
+| **Finetune** | `--stage finetune` | `alpha_base`, `mlp_anchor_coeff`, `finetune_steps`, `propagation_hops` | `Inc_MSE + 0.3 × Base_MSE` |
+
+### Example Commands
+
+**Run all stages sequentially with Optuna (50 trials each):**
+
+```bash
+python tune_hyperparams.py --stage all --mode optuna --n_trials 50
+```
+
+**Tune only the base model (grid search):**
+
+```bash
+python tune_hyperparams.py --stage base --mode grid
+```
+
+**Tune inc parameters using a pre-trained base checkpoint:**
+
+```bash
+python tune_hyperparams.py --stage inc --mode optuna --n_trials 30 \
+    --base_weight_path checkpoints/base_model_nl27k_ind.pth
+```
+
+**Tune finetune parameters with 3 seeds for robustness:**
+
+```bash
+python tune_hyperparams.py --stage finetune --mode optuna --n_trials 30 \
+    --n_seeds 3 --base_weight_path checkpoints/base_model_nl27k_ind.pth
+```
+
+**Use a different dataset:**
+
+```bash
+python tune_hyperparams.py --stage all --mode optuna --data_dir datasets/cn15k_ind
+```
+
+### Interpreting Results
+
+All results are written to `tuning_results/` (configurable via `--output_dir`):
+
+* `results_{stage}_{mode}.csv` — all trials with parameter values and objective scores
+* `best_params_{stage}.json` — best hyperparameters found for that stage
+* `best_params_combined.json` — merged best parameters across all stages run
+
+After tuning, apply the best parameters by passing them as command-line arguments:
+
+```bash
+python train_base.py --base_lr 0.002 --dropout_rate 0.2 --alpha_cl 0.7
+python run_incremental.py --inc_lr 0.003 --lambda_reg 0.05 --gamma 0.85
+```
+
+### CLI Reference
+
+```
+--stage {base,inc,finetune,all}   Which stage(s) to tune (default: all)
+--mode  {optuna,grid}             Search strategy (default: optuna)
+--n_trials N                      Optuna trials per stage (default: 50)
+--data_dir PATH                   Dataset directory (default: datasets/nl27k_ind)
+--n_seeds N                       Seeds to average per trial (default: 1)
+--output_dir PATH                 Where to save results (default: tuning_results/)
+--base_weight_path PATH           Pre-trained base checkpoint for inc/finetune stages
+```
+
 ## 🧠 Core Methodology Components
 
 * **Heteroscedastic Confidence Prediction (`model.py`)**: Outputs both $\mu_\tau$ and $\sigma_\tau^2$ to dynamically scale learning weights.

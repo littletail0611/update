@@ -132,6 +132,12 @@ def run_incremental_update(args):
     torch.save(dataset.belief_state, final_belief_path)
     print(f">>> 全局 Belief 状态已保存至 {final_belief_path}")
 
+    return {
+        "inc_test": inc_test_metrics,
+        "base_test": base_test_metrics,
+        "combined_test": combined_test_metrics,
+    }
+
 if __name__ == "__main__":
     args = get_args()
     torch.manual_seed(args.seed)

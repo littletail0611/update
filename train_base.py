@@ -139,6 +139,7 @@ def train_base(args):
     
     test_metrics = evaluate_model(model, dataset.base_test, z=best_z, device=args.device)
     Logger.print_metrics("Base Test Set", test_metrics)
+    return test_metrics
 
 if __name__ == "__main__":
     args = get_args()
