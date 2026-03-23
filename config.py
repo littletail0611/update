@@ -41,6 +41,7 @@ def get_args():
     parser.add_argument("--propagation_hops", type=int, default=2, help="Number of hops for label propagation")
     parser.add_argument("--soft_label_weight", type=float, default=0.5, help="Weight for sigma-weighted soft supervision loss on new facts")
     parser.add_argument("--dynamic_update_interval", type=int, default=2, help="Update pseudo-label every N finetune steps (0 to disable)")
+    parser.add_argument("--func_anchor_ratio", type=float, default=0.9, help="Blend ratio for functional anchoring: func_anchor_ratio * functional_loss + (1 - func_anchor_ratio) * weak_absolute_L2")
 
     args = parser.parse_args()
     return args
