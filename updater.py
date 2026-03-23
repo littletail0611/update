@@ -107,13 +107,7 @@ class UnifiedConfidenceUpdater:
                         ent_weight[ent_id] = ent_weight[neighbor_tensor].mean(dim=0)
 
     def _consistency_inference(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf):
-        """Consistency regularization + structured pseudo-labels + Base outer constraint.
-
-        For each new fact (h, r, t) we build a structure-aware pseudo label from the
-        known confidences of h/t's existing neighbours (relation-weighted average).
-        A heteroscedastic pseudo-label loss provides directional gradients that pure
-        consistency loss lacks.  Dynamic weight scheduling blends both signals.
-        """
+        """Label Propagation + Consistency Regularization + Base outer constraint."""
         self.model.train()
 
         # Collect trainable parameters: entity embeddings + unfrozen last layer of mlp_mean
@@ -127,35 +121,72 @@ class UnifiedConfidenceUpdater:
         combined_edge_type = torch.cat([base_edge_type, r_idx], dim=0)
 
         # ------------------------------------------------------------------
-        # Step 1: Compute structure-aware pseudo labels from neighbour confs
+        # Step 1: Build label propagation index from base graph (one-time)
         # ------------------------------------------------------------------
-        struct_priors = []
-        for i in range(len(h_idx)):
-            h, r, t = h_idx[i].item(), r_idx[i].item(), t_idx[i].item()
-            neighbor_confs = []
+        # hr_conf: h as head with relation r -> [conf values]
+        # tr_conf: t as tail with relation r -> [conf values]
+        # r_conf:  relation r global -> [conf values]
+        hr_conf = {}  # (h_id, r_id) -> [conf values]
+        tr_conf = {}  # (t_id, r_id) -> [conf values]
+        r_conf = {}   # r_id -> [conf values]
 
-            # Confidences of known facts involving h
-            h_mask = (base_edge_idx[0] == h) | (base_edge_idx[1] == h)
-            if h_mask.any():
-                neighbor_confs.extend(base_edge_conf[h_mask].tolist())
+        base_h = base_edge_idx[0].tolist()
+        base_t = base_edge_idx[1].tolist()
+        base_r = base_edge_type.tolist()
+        base_c = base_edge_conf.tolist()
 
-            # Confidences of known facts involving t
-            t_mask = (base_edge_idx[0] == t) | (base_edge_idx[1] == t)
-            if t_mask.any():
-                neighbor_confs.extend(base_edge_conf[t_mask].tolist())
+        for i in range(len(base_h)):
+            h_val = base_h[i]
+            t_val = base_t[i]
+            r_val = base_r[i]
+            c_val = base_c[i]
 
-            # Relation prior from same-relation base facts
-            r_mask = (base_edge_type == r)
-            rel_prior = base_edge_conf[r_mask].mean().item() if r_mask.any() else 0.5
+            hr_key = (h_val, r_val)
+            tr_key = (t_val, r_val)
 
-            if neighbor_confs:
-                struct_prior = 0.5 * (sum(neighbor_confs) / len(neighbor_confs)) + 0.5 * rel_prior
+            if hr_key not in hr_conf:
+                hr_conf[hr_key] = []
+            hr_conf[hr_key].append(c_val)
+
+            if tr_key not in tr_conf:
+                tr_conf[tr_key] = []
+            tr_conf[tr_key].append(c_val)
+
+            if r_val not in r_conf:
+                r_conf[r_val] = []
+            r_conf[r_val].append(c_val)
+
+        # Pre-compute relation-level means
+        r_mean = {r: sum(cs) / len(cs) for r, cs in r_conf.items()}
+
+        # ------------------------------------------------------------------
+        # Step 2: Compute individualized label-propagation pseudo-labels
+        # ------------------------------------------------------------------
+        lp_labels = []
+        for i in range(h_idx.shape[0]):
+            h_val = h_idx[i].item()
+            r_val = r_idx[i].item()
+            t_val = t_idx[i].item()
+
+            s1 = hr_conf.get((h_val, r_val), None)  # h's outgoing edges with relation r
+            s2 = tr_conf.get((t_val, r_val), None)  # t's incoming edges with relation r
+            s3 = r_mean.get(r_val, 0.5)             # global relation prior
+
+            s1_mean = sum(s1) / len(s1) if s1 else None
+            s2_mean = sum(s2) / len(s2) if s2 else None
+
+            if s1_mean is not None and s2_mean is not None:
+                label = 0.4 * s1_mean + 0.4 * s2_mean + 0.2 * s3
+            elif s1_mean is not None:
+                label = 0.6 * s1_mean + 0.4 * s3
+            elif s2_mean is not None:
+                label = 0.6 * s2_mean + 0.4 * s3
             else:
-                struct_prior = rel_prior
+                label = s3
 
-            struct_priors.append(struct_prior)
+            lp_labels.append(label)
 
-        struct_prior_conf = torch.tensor(struct_priors, dtype=torch.float, device=self.device)
+        struct_prior_conf = torch.tensor(lp_labels, dtype=torch.float, device=self.device)
 
         # Initialize GNN input confidences for new facts using struct priors
         combined_edge_conf = torch.cat([base_edge_conf, struct_prior_conf], dim=0)
