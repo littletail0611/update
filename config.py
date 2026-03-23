@@ -39,6 +39,8 @@ def get_args():
     parser.add_argument("--mlp_anchor_coeff", type=float, default=0.01, help="MLP anchor regularization coefficient")
     parser.add_argument("--finetune_steps", type=int, default=5, help="Fine-tuning steps in propagate-then-finetune stage")
     parser.add_argument("--propagation_hops", type=int, default=2, help="Number of hops for label propagation")
+    parser.add_argument("--soft_label_weight", type=float, default=0.5, help="Weight for sigma-weighted soft supervision loss on new facts")
+    parser.add_argument("--dynamic_update_interval", type=int, default=2, help="Update pseudo-label every N finetune steps (0 to disable)")
 
     args = parser.parse_args()
     return args

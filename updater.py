@@ -204,6 +204,8 @@ class UnifiedConfidenceUpdater:
         lambda_reg = min(lambda_reg, 0.01)
         alpha_base = getattr(self.args, 'alpha_base', 1.0) if self.args else 1.0
         mlp_anchor_coeff = getattr(self.args, 'mlp_anchor_coeff', 0.01) if self.args else 0.01
+        soft_label_weight = getattr(self.args, 'soft_label_weight', 0.5) if self.args else 0.5
+        dynamic_update_interval = getattr(self.args, 'dynamic_update_interval', 2) if self.args else 2
         base_num_ent = self.dataset.base_num_ent
 
         # ------------------------------------------------------------------
@@ -246,10 +248,19 @@ class UnifiedConfidenceUpdater:
 
         self.model.train()
 
-        for _ in range(finetune_steps):
+        for step in range(finetune_steps):
             optimizer.zero_grad()
 
             z = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
+
+            # Sigma-weighted soft supervision loss on new facts (HPL-inspired)
+            # Use propagated_conf as soft target; weight by exp(-sigma) so uncertain
+            # predictions receive less gradient from the pseudo-label.
+            mu_new_pred, sigma_new_pred = self.model.predict(z[h_idx], r_idx, z[t_idx])
+            # exp(-sigma) in (0, 1]; divide by 2 to keep max weight at 0.5 so
+            # soft-label loss is at most half the magnitude of a standard MSE term.
+            weight_new = torch.exp(-sigma_new_pred.detach()) / 2.0
+            loss_soft = torch.mean(weight_new * (mu_new_pred - propagated_conf.detach()) ** 2)
 
             # Sole supervision: base GT on shared-entity edges
             if replay_mask.any():
@@ -276,11 +287,20 @@ class UnifiedConfidenceUpdater:
                     loss_mlp_anchor = loss_mlp_anchor + torch.mean((param - old_mlp_params[name]) ** 2)
             loss_mlp_anchor = mlp_anchor_coeff * loss_mlp_anchor
 
-            loss_total = alpha_base * loss_base + loss_reg + loss_mlp_anchor
+            loss_total = alpha_base * loss_base + soft_label_weight * loss_soft + loss_reg + loss_mlp_anchor
             loss_total.backward()
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
+
+            # Dynamic pseudo-label update: refresh combined_edge_conf for new facts
+            # every dynamic_update_interval steps so the soft target tracks the model.
+            # Skip step 0 — the model hasn't been updated yet at that point.
+            if dynamic_update_interval > 0 and step > 0 and step % dynamic_update_interval == 0:
+                with torch.no_grad():
+                    combined_edge_conf = torch.cat(
+                        [base_edge_conf, mu_new_pred.detach().clamp(0.0, 1.0)], dim=0
+                    )
 
         # Final prediction for new facts using fine-tuned embeddings
         self.model.eval()
