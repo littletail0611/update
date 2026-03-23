@@ -24,14 +24,6 @@ class UnifiedConfidenceUpdater:
         for param in self.model.mlp_mean[3].parameters():
             param.requires_grad = True
 
-        # Pre-index inc_valid facts by relation for EM calibration
-        self.valid_by_rel = {}
-        for fact in dataset.inc_valid:
-            r = fact[1]
-            if r not in self.valid_by_rel:
-                self.valid_by_rel[r] = []
-            self.valid_by_rel[r].append(fact)
-
     def step(self, new_facts_batch):
         h_idx = torch.tensor([f[0] for f in new_facts_batch], dtype=torch.long, device=self.device)
         r_idx = torch.tensor([f[1] for f in new_facts_batch], dtype=torch.long, device=self.device)
@@ -115,11 +107,12 @@ class UnifiedConfidenceUpdater:
                         ent_weight[ent_id] = ent_weight[neighbor_tensor].mean(dim=0)
 
     def _consistency_inference(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf):
-        """Consistency regularization + Base outer constraint (replaces EM pseudo-label inference).
+        """Consistency regularization + structured pseudo-labels + Base outer constraint.
 
-        Instead of giving new facts a concrete pseudo-label target, we use two stochastic
-        views of the same graph (one clean, one with edge dropout) and minimise their
-        prediction discrepancy.  A base-GT constraint keeps the embeddings from drifting.
+        For each new fact (h, r, t) we build a structure-aware pseudo label from the
+        known confidences of h/t's existing neighbours (relation-weighted average).
+        A heteroscedastic pseudo-label loss provides directional gradients that pure
+        consistency loss lacks.  Dynamic weight scheduling blends both signals.
         """
         self.model.train()
 
@@ -133,16 +126,39 @@ class UnifiedConfidenceUpdater:
         combined_edge_index = torch.cat([base_edge_idx, new_edge_index], dim=1)
         combined_edge_type = torch.cat([base_edge_type, r_idx], dim=0)
 
-        # Initialize new-fact confidences using relation priors (GNN input only, NOT a loss target)
-        rel_priors = []
-        for r in r_idx:
-            mask = (base_edge_type == r)
-            if mask.any():
-                rel_priors.append(base_edge_conf[mask].mean().item())
+        # ------------------------------------------------------------------
+        # Step 1: Compute structure-aware pseudo labels from neighbour confs
+        # ------------------------------------------------------------------
+        struct_priors = []
+        for i in range(len(h_idx)):
+            h, r, t = h_idx[i].item(), r_idx[i].item(), t_idx[i].item()
+            neighbor_confs = []
+
+            # Confidences of known facts involving h
+            h_mask = (base_edge_idx[0] == h) | (base_edge_idx[1] == h)
+            if h_mask.any():
+                neighbor_confs.extend(base_edge_conf[h_mask].tolist())
+
+            # Confidences of known facts involving t
+            t_mask = (base_edge_idx[0] == t) | (base_edge_idx[1] == t)
+            if t_mask.any():
+                neighbor_confs.extend(base_edge_conf[t_mask].tolist())
+
+            # Relation prior from same-relation base facts
+            r_mask = (base_edge_type == r)
+            rel_prior = base_edge_conf[r_mask].mean().item() if r_mask.any() else 0.5
+
+            if neighbor_confs:
+                struct_prior = 0.5 * (sum(neighbor_confs) / len(neighbor_confs)) + 0.5 * rel_prior
             else:
-                rel_priors.append(0.5)
-        prior_conf = torch.tensor(rel_priors, dtype=torch.float, device=self.device)
-        combined_edge_conf = torch.cat([base_edge_conf, prior_conf], dim=0)
+                struct_prior = rel_prior
+
+            struct_priors.append(struct_prior)
+
+        struct_prior_conf = torch.tensor(struct_priors, dtype=torch.float, device=self.device)
+
+        # Initialize GNN input confidences for new facts using struct priors
+        combined_edge_conf = torch.cat([base_edge_conf, struct_prior_conf], dim=0)
 
         old_emb_snapshot = self.model.entity_emb.weight.detach().clone()
         base_num_ent = self.dataset.base_num_ent
@@ -155,7 +171,6 @@ class UnifiedConfidenceUpdater:
         }
 
         # Identify base edges that share at least one entity with the new facts
-        # (used for the Base outer-constraint loss with GT confidences)
         new_ents_tensor = torch.cat([h_idx, t_idx]).unique()
         replay_mask = (
             torch.isin(base_edge_idx[0], new_ents_tensor) |
@@ -168,6 +183,23 @@ class UnifiedConfidenceUpdater:
         edge_drop_rate = getattr(self.args, 'edge_drop_rate', 0.2) if self.args else 0.2
         alpha_base = getattr(self.args, 'alpha_base', 1.0) if self.args else 1.0
         mlp_anchor_coeff = getattr(self.args, 'mlp_anchor_coeff', 0.01) if self.args else 0.01
+
+        # ------------------------------------------------------------------
+        # Step 2: Zero-shot GNN inference → uncertainty-adaptive target_conf
+        # ------------------------------------------------------------------
+        self.model.eval()
+        with torch.no_grad():
+            init_z = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
+            mu_zero_shot, sigma_zero_shot = self.model.predict(init_z[h_idx], r_idx, init_z[t_idx])
+
+        # Uncertainty-adaptive blend: high-sigma facts lean on struct prior
+        confidence_weight = 1.0 / (1.0 + sigma_zero_shot.detach())
+        target_conf = (
+            (1 - confidence_weight) * struct_prior_conf
+            + confidence_weight * mu_zero_shot.detach()
+        )
+
+        self.model.train()
 
         mu_v1 = sigma_v1 = None
 
@@ -195,7 +227,13 @@ class UnifiedConfidenceUpdater:
             # (1) Consistency loss: View 1 chases View 2 (detached), no GT needed
             loss_consistency = torch.mean((mu_v1 - mu_v2.detach()) ** 2)
 
-            # (2) Base outer-constraint loss: use GT confidences on shared-entity base edges
+            # (2) Heteroscedastic pseudo-label loss: structure-aware target drives learning
+            loss_pseudo = torch.mean(
+                ((target_conf.detach() - mu_v1) ** 2) / (sigma_v1 + 1e-6)
+                + torch.log(sigma_v1 + 1e-6)
+            )
+
+            # (3) Base outer-constraint loss: use GT confidences on shared-entity base edges
             if replay_mask.any():
                 replay_edges = base_edge_idx[:, replay_mask]
                 replay_rels = base_edge_type[replay_mask]
@@ -207,26 +245,42 @@ class UnifiedConfidenceUpdater:
             else:
                 loss_base = torch.tensor(0.0, device=self.device)
 
-            # (3) Embedding anchor regularisation (prevent catastrophic forgetting)
+            # (4) Embedding anchor regularisation (prevent catastrophic forgetting)
             curr_z = self.model.entity_emb.weight
             loss_reg = lambda_reg * torch.mean(
                 (curr_z[:base_num_ent] - old_emb_snapshot[:base_num_ent]) ** 2
             )
 
-            # (4) MLP anchor regularisation (keep unfrozen MLP head close to base model)
+            # (5) MLP anchor regularisation (keep unfrozen MLP head close to base model)
             loss_mlp_anchor = torch.tensor(0.0, device=self.device)
             for name, param in self.model.mlp_mean.named_parameters():
                 if param.requires_grad and name in old_mlp_params:
                     loss_mlp_anchor = loss_mlp_anchor + torch.mean((param - old_mlp_params[name]) ** 2)
             loss_mlp_anchor = mlp_anchor_coeff * loss_mlp_anchor
 
-            loss_total = loss_consistency + alpha_base * loss_base + loss_reg + loss_mlp_anchor
+            # Dynamic weight schedule: early steps trust pseudo-label more (direction),
+            # later steps trust consistency more (stability)
+            pseudo_weight = max(0.3, 1.0 - step / max(1, em_steps - 1))
+            consistency_weight = 1.0 - pseudo_weight
+
+            loss_total = (
+                pseudo_weight * loss_pseudo
+                + consistency_weight * loss_consistency
+                + alpha_base * loss_base
+                + loss_reg
+                + loss_mlp_anchor
+            )
             loss_total.backward()
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
 
-            # Dynamically refresh edge_conf for new facts using the updated model (optional)
+            # EMA update: pseudo label gradually moves toward model prediction
+            with torch.no_grad():
+                momentum = 0.9 - 0.4 * (step / max(1, em_steps - 1))  # 0.9 → 0.5
+                target_conf = momentum * target_conf + (1 - momentum) * mu_v1.detach()
+
+            # Refresh edge_conf for new facts using the updated model
             with torch.no_grad():
                 z_updated = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
                 mu_updated, _ = self.model.predict(z_updated[h_idx], r_idx, z_updated[t_idx])
