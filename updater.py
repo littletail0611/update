@@ -206,6 +206,7 @@ class UnifiedConfidenceUpdater:
         mlp_anchor_coeff = getattr(self.args, 'mlp_anchor_coeff', 0.01) if self.args else 0.01
         soft_label_weight = getattr(self.args, 'soft_label_weight', 0.5) if self.args else 0.5
         dynamic_update_interval = getattr(self.args, 'dynamic_update_interval', 2) if self.args else 2
+        func_anchor_ratio = getattr(self.args, 'func_anchor_ratio', 0.9) if self.args else 0.9
         base_num_ent = self.dataset.base_num_ent
 
         # ------------------------------------------------------------------
@@ -246,6 +247,21 @@ class UnifiedConfidenceUpdater:
         trainable_params += [p for p in self.model.mlp_mean.parameters() if p.requires_grad]
         optimizer = optim.Adam(trainable_params, lr=self.lr)
 
+        # Snapshot functional anchor: old model predictions on replay base edges
+        # Used to preserve prediction behaviour rather than absolute embedding positions
+        with torch.no_grad():
+            self.model.eval()
+            if replay_mask.any():
+                z_old_snapshot = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
+                replay_edges_snap = base_edge_idx[:, replay_mask]
+                replay_rels_snap = base_edge_type[replay_mask]
+                mu_old_pred_replay, _ = self.model.predict(
+                    z_old_snapshot[replay_edges_snap[0]], replay_rels_snap, z_old_snapshot[replay_edges_snap[1]]
+                )
+                mu_old_pred_replay = mu_old_pred_replay.detach()
+            else:
+                mu_old_pred_replay = None
+
         self.model.train()
 
         for step in range(finetune_steps):
@@ -275,10 +291,20 @@ class UnifiedConfidenceUpdater:
                 loss_base = torch.tensor(0.0, device=self.device)
 
             # Embedding anchor regularisation (prevent catastrophic forgetting)
+            # Functional anchoring: penalise changes in predictions on replay edges
+            # rather than absolute embedding positions. A weak absolute L2 term prevents
+            # degenerate solutions where embeddings drift to infinity.
             curr_emb = self.model.entity_emb.weight
-            loss_reg = lambda_reg * torch.mean(
+            weak_l2 = lambda_reg * (1.0 - func_anchor_ratio) * torch.mean(
                 (curr_emb[:base_num_ent] - old_emb_snapshot[:base_num_ent]) ** 2
             )
+            if replay_mask.any() and mu_old_pred_replay is not None:
+                # mu_base_pred was computed on the same replay edges just above (lines 286-289);
+                # reuse it as the current predictions for the functional anchor.
+                func_loss = F.mse_loss(mu_base_pred, mu_old_pred_replay)
+                loss_reg = lambda_reg * func_anchor_ratio * func_loss + weak_l2
+            else:
+                loss_reg = weak_l2
 
             # MLP anchor regularisation (keep unfrozen head close to base model)
             loss_mlp_anchor = torch.tensor(0.0, device=self.device)
@@ -366,6 +392,7 @@ class UnifiedConfidenceUpdater:
         lambda_reg = self.args.lambda_reg if self.args else 0.001
         # Cap lambda_reg to prevent over-restriction in refinement stage
         lambda_reg = min(lambda_reg, 0.01)
+        func_anchor_ratio = getattr(self.args, 'func_anchor_ratio', 0.9) if self.args else 0.9
         alpha = 1.0
         steps = self.args.refine_steps if self.args else 3
 
@@ -375,6 +402,18 @@ class UnifiedConfidenceUpdater:
             affected_mask = S_tau > threshold
 
         real_affected_count = affected_mask.sum().item()
+
+        # Snapshot functional anchor: old predictions on affected base edges using old embeddings
+        with torch.no_grad():
+            if affected_mask.any():
+                affected_edges_old = base_edge_idx[:, affected_mask]
+                affected_rels_old = base_edge_type[affected_mask]
+                mu_old_affected, _ = self.model.predict(
+                    old_z[affected_edges_old[0]], affected_rels_old, old_z[affected_edges_old[1]]
+                )
+                mu_old_affected = mu_old_affected.detach()
+            else:
+                mu_old_affected = None
 
         self.model.train()
         optimizer = optim.Adam([self.model.entity_emb.weight], lr=self.lr)
@@ -396,8 +435,21 @@ class UnifiedConfidenceUpdater:
             else:
                 loss_affected = torch.tensor(0.0, device=self.device)
 
-            # 3. Elastic anchor: L2 distance in embedding space
-            loss_reg = lambda_reg * torch.mean((curr_z[:self.dataset.base_num_ent] - old_z[:self.dataset.base_num_ent].detach()) ** 2)
+            # 3. Elastic anchor: functional anchoring preserves prediction behaviour on
+            # affected edges; a weak absolute L2 prevents unbounded embedding drift.
+            weak_l2 = lambda_reg * (1.0 - func_anchor_ratio) * torch.mean(
+                (curr_z[:self.dataset.base_num_ent] - old_z[:self.dataset.base_num_ent].detach()) ** 2
+            )
+            if affected_mask.any() and mu_old_affected is not None:
+                affected_edges_cur = base_edge_idx[:, affected_mask]
+                affected_rels_cur = base_edge_type[affected_mask]
+                mu_cur_affected, _ = self.model.predict(
+                    curr_z[affected_edges_cur[0]], affected_rels_cur, curr_z[affected_edges_cur[1]]
+                )
+                func_loss = F.mse_loss(mu_cur_affected, mu_old_affected)
+                loss_reg = lambda_reg * func_anchor_ratio * func_loss + weak_l2
+            else:
+                loss_reg = weak_l2
 
             loss_total = loss_new + alpha * loss_affected + loss_reg
             loss_total.backward()
