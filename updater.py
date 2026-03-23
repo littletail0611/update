@@ -44,8 +44,8 @@ class UnifiedConfidenceUpdater:
             # Save old raw embeddings for elastic anchor regularization
             old_raw_emb = self.model.entity_emb.weight.detach().clone()
 
-        # 1. Consistency inference stage (replaces EM pseudo-label inference)
-        new_mu, new_sigma_sq = self._consistency_inference(h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf)
+        # 1. Propagate-then-finetune stage (deterministic label propagation + base-GT-only fine-tuning)
+        new_mu, new_sigma_sq = self._propagate_then_finetune(h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf)
 
         # 2. Causal influence assessment
         S_tau, mu_with, sigma_sq_old = self._compute_causal_influence(base_edge_idx, base_edge_type, base_edge_conf, mu_without, h_idx, r_idx, t_idx, new_mu, new_sigma_sq)
@@ -106,225 +106,189 @@ class UnifiedConfidenceUpdater:
                         neighbor_tensor = torch.tensor(neighbors, dtype=torch.long, device=self.device)
                         ent_weight[ent_id] = ent_weight[neighbor_tensor].mean(dim=0)
 
-    def _consistency_inference(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf):
-        """Label Propagation + Consistency Regularization + Base outer constraint."""
-        self.model.train()
+    def _label_propagation(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf, hops=2):
+        """Deterministic label propagation from base GT to new facts. No model involved.
 
-        # Collect trainable parameters: entity embeddings + unfrozen last layer of mlp_mean
-        trainable_params = [self.model.entity_emb.weight]
-        trainable_params += [p for p in self.model.mlp_mean.parameters() if p.requires_grad]
-        optimizer = optim.Adam(trainable_params, lr=self.lr)
+        For each new fact (h, r, t):
+          1-hop : base edges where h or t appears as head or tail; same-relation edges
+                  get weight 2.0, different-relation edges get weight 1.0.
+          2-hop : if no 1-hop base neighbors exist, look through intermediate entities
+                  reachable from h/t via the current new-facts batch; half-weight (0.5×).
+          fallback: global relation-prior mean; then overall graph mean.
+        """
+        # Precompute relation-prior and global-mean from base GT (no model access)
+        r_prior = {}
+        for r_val in base_edge_type.unique().tolist():
+            mask = (base_edge_type == r_val)
+            r_prior[r_val] = base_edge_conf[mask].mean().item()
+        global_mean = base_edge_conf.mean().item() if base_edge_conf.numel() > 0 else 0.5
 
-        # Build combined graph (base edges + new edges)
+        propagated = []
+
+        for i in range(h_idx.shape[0]):
+            h = h_idx[i].item()
+            r = r_idx[i].item()
+            t = t_idx[i].item()
+
+            # --- 1-hop: base edges involving h or t ---
+            h_mask = (base_edge_idx[0] == h) | (base_edge_idx[1] == h)
+            t_mask = (base_edge_idx[0] == t) | (base_edge_idx[1] == t)
+
+            confs, wts = [], []
+            for mask in [h_mask, t_mask]:
+                if mask.any():
+                    nc = base_edge_conf[mask]
+                    nr = base_edge_type[mask]
+                    same = (nr == r).float()
+                    w = 1.0 + same  # same=1.0 for matching relation → w=2.0; same=0.0 otherwise → w=1.0
+                    confs.append(nc)
+                    wts.append(w)
+
+            if confs:
+                all_c = torch.cat(confs)
+                all_w = torch.cat(wts)
+                propagated.append((all_c * all_w).sum() / all_w.sum())
+                continue
+
+            # --- 2-hop fallback: intermediate entities from the new-fact batch ---
+            if hops >= 2:
+                inter_ents = set()
+                h_new = (h_idx == h) | (t_idx == h)
+                t_new = (h_idx == t) | (t_idx == t)
+                for nm in [h_new, t_new]:
+                    if nm.any():
+                        inter_ents.update(h_idx[nm].tolist())
+                        inter_ents.update(t_idx[nm].tolist())
+                inter_ents.discard(h)
+                inter_ents.discard(t)
+
+                hop2_c, hop2_w = [], []
+                for e in inter_ents:
+                    e_mask = (base_edge_idx[0] == e) | (base_edge_idx[1] == e)
+                    if e_mask.any():
+                        ec = base_edge_conf[e_mask]
+                        er = base_edge_type[e_mask]
+                        same = (er == r).float()
+                        w = 0.5 * (1.0 + same)  # 2-hop half-weight: 0.5 for different relation, 1.0 for same relation
+                        hop2_c.append(ec)
+                        hop2_w.append(w)
+
+                if hop2_c:
+                    all_c = torch.cat(hop2_c)
+                    all_w = torch.cat(hop2_w)
+                    propagated.append((all_c * all_w).sum() / all_w.sum())
+                    continue
+
+            # --- Ultimate fallback: relation prior, then global mean ---
+            prior_val = r_prior.get(r, global_mean)
+            propagated.append(torch.tensor(prior_val, dtype=torch.float, device=self.device))
+
+        return torch.stack(propagated)
+
+    def _propagate_then_finetune(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf):
+        """Two-phase approach: deterministic label propagation then base-GT-only fine-tuning.
+
+        Phase 1 (no gradients, no model):
+            Compute propagated_conf for new edges via _label_propagation.
+
+        Phase 2 (with gradients, GT supervision only):
+            Fine-tune entity_emb (+ unfrozen mlp_mean last layer) using MSE against base GT
+            on edges that share at least one entity with the new facts.
+            No consistency loss, no pseudo-label loss.
+
+        Returns (new_mu, new_sigma) predicted after fine-tuning.
+        """
+        propagation_hops = getattr(self.args, 'propagation_hops', 2) if self.args else 2
+        finetune_steps = getattr(self.args, 'finetune_steps', 5) if self.args else 5
+        lambda_reg = self.args.lambda_reg if self.args else 0.001
+        lambda_reg = min(lambda_reg, 0.01)
+        alpha_base = getattr(self.args, 'alpha_base', 1.0) if self.args else 1.0
+        mlp_anchor_coeff = getattr(self.args, 'mlp_anchor_coeff', 0.01) if self.args else 0.01
+        base_num_ent = self.dataset.base_num_ent
+
+        # ------------------------------------------------------------------
+        # Phase 1: Deterministic label propagation (no model, no gradients)
+        # ------------------------------------------------------------------
+        with torch.no_grad():
+            propagated_conf = self._label_propagation(
+                h_idx, r_idx, t_idx,
+                base_edge_idx, base_edge_type, base_edge_conf,
+                hops=propagation_hops,
+            )
+
+        # Build combined graph using propagated_conf as input confidence for new edges
         new_edge_index = torch.stack([h_idx, t_idx], dim=0)
         combined_edge_index = torch.cat([base_edge_idx, new_edge_index], dim=1)
         combined_edge_type = torch.cat([base_edge_type, r_idx], dim=0)
+        combined_edge_conf = torch.cat([base_edge_conf, propagated_conf], dim=0)
 
         # ------------------------------------------------------------------
-        # Step 1: Build label propagation index from base graph (one-time)
+        # Phase 2: Base-GT-supervised fine-tuning (no pseudo-labels, no consistency loss)
         # ------------------------------------------------------------------
-        # hr_conf: h as head with relation r -> [conf values]
-        # tr_conf: t as tail with relation r -> [conf values]
-        # r_conf:  relation r global -> [conf values]
-        hr_conf = {}  # (h_id, r_id) -> [conf values]
-        tr_conf = {}  # (t_id, r_id) -> [conf values]
-        r_conf = {}   # r_id -> [conf values]
-
-        base_h = base_edge_idx[0].tolist()
-        base_t = base_edge_idx[1].tolist()
-        base_r = base_edge_type.tolist()
-        base_c = base_edge_conf.tolist()
-
-        for i in range(len(base_h)):
-            h_val = base_h[i]
-            t_val = base_t[i]
-            r_val = base_r[i]
-            c_val = base_c[i]
-
-            hr_key = (h_val, r_val)
-            tr_key = (t_val, r_val)
-
-            if hr_key not in hr_conf:
-                hr_conf[hr_key] = []
-            hr_conf[hr_key].append(c_val)
-
-            if tr_key not in tr_conf:
-                tr_conf[tr_key] = []
-            tr_conf[tr_key].append(c_val)
-
-            if r_val not in r_conf:
-                r_conf[r_val] = []
-            r_conf[r_val].append(c_val)
-
-        # Pre-compute relation-level means
-        r_mean = {r: sum(cs) / len(cs) for r, cs in r_conf.items()}
-
-        # ------------------------------------------------------------------
-        # Step 2: Compute individualized label-propagation pseudo-labels
-        # ------------------------------------------------------------------
-        lp_labels = []
-        for i in range(h_idx.shape[0]):
-            h_val = h_idx[i].item()
-            r_val = r_idx[i].item()
-            t_val = t_idx[i].item()
-
-            s1 = hr_conf.get((h_val, r_val), None)  # h's outgoing edges with relation r
-            s2 = tr_conf.get((t_val, r_val), None)  # t's incoming edges with relation r
-            s3 = r_mean.get(r_val, 0.5)             # global relation prior
-
-            s1_mean = sum(s1) / len(s1) if s1 else None
-            s2_mean = sum(s2) / len(s2) if s2 else None
-
-            if s1_mean is not None and s2_mean is not None:
-                label = 0.4 * s1_mean + 0.4 * s2_mean + 0.2 * s3
-            elif s1_mean is not None:
-                label = 0.6 * s1_mean + 0.4 * s3
-            elif s2_mean is not None:
-                label = 0.6 * s2_mean + 0.4 * s3
-            else:
-                label = s3
-
-            lp_labels.append(label)
-
-        struct_prior_conf = torch.tensor(lp_labels, dtype=torch.float, device=self.device)
-
-        # Initialize GNN input confidences for new facts using struct priors
-        combined_edge_conf = torch.cat([base_edge_conf, struct_prior_conf], dim=0)
-
+        # Snapshot embeddings and unfrozen MLP weights for anchor regularisation
         old_emb_snapshot = self.model.entity_emb.weight.detach().clone()
-        base_num_ent = self.dataset.base_num_ent
-
-        # Snapshot unfrozen MLP parameters for anchor regularisation
         old_mlp_params = {
             name: param.detach().clone()
             for name, param in self.model.mlp_mean.named_parameters()
             if param.requires_grad
         }
 
-        # Identify base edges that share at least one entity with the new facts
+        # Base edges that share at least one entity with the new facts (replay supervision)
         new_ents_tensor = torch.cat([h_idx, t_idx]).unique()
         replay_mask = (
             torch.isin(base_edge_idx[0], new_ents_tensor) |
             torch.isin(base_edge_idx[1], new_ents_tensor)
         )
 
-        em_steps = self.args.em_steps if self.args else 5
-        lambda_reg = self.args.lambda_reg if self.args else 0.001
-        lambda_reg = min(lambda_reg, 0.01)
-        edge_drop_rate = getattr(self.args, 'edge_drop_rate', 0.2) if self.args else 0.2
-        alpha_base = getattr(self.args, 'alpha_base', 1.0) if self.args else 1.0
-        mlp_anchor_coeff = getattr(self.args, 'mlp_anchor_coeff', 0.01) if self.args else 0.01
-
-        # ------------------------------------------------------------------
-        # Step 2: Zero-shot GNN inference → uncertainty-adaptive target_conf
-        # ------------------------------------------------------------------
-        self.model.eval()
-        with torch.no_grad():
-            init_z = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
-            mu_zero_shot, sigma_zero_shot = self.model.predict(init_z[h_idx], r_idx, init_z[t_idx])
-
-        # Uncertainty-adaptive blend: high-sigma facts lean on struct prior
-        confidence_weight = 1.0 / (1.0 + sigma_zero_shot.detach())
-        target_conf = (
-            (1 - confidence_weight) * struct_prior_conf
-            + confidence_weight * mu_zero_shot.detach()
-        )
+        trainable_params = [self.model.entity_emb.weight]
+        trainable_params += [p for p in self.model.mlp_mean.parameters() if p.requires_grad]
+        optimizer = optim.Adam(trainable_params, lr=self.lr)
 
         self.model.train()
 
-        mu_v1 = sigma_v1 = None
-
-        for step in range(em_steps):
+        for _ in range(finetune_steps):
             optimizer.zero_grad()
 
-            # === View 1: normal forward on full combined graph ===
-            z_normal = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
-            mu_v1, sigma_v1 = self.model.predict(z_normal[h_idx], r_idx, z_normal[t_idx])
+            z = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
 
-            # === View 2: edge-dropped forward (stop gradient) ===
-            drop_mask = torch.rand(combined_edge_index.shape[1], device=self.device) > edge_drop_rate
-            # Ensure at least one edge survives to keep the GNN well-defined
-            if not drop_mask.any():
-                drop_mask = drop_mask.clone()
-                drop_mask[0] = True
-            dropped_edge_index = combined_edge_index[:, drop_mask]
-            dropped_edge_type = combined_edge_type[drop_mask]
-            dropped_edge_conf = combined_edge_conf[drop_mask]
-
-            with torch.no_grad():
-                z_dropped = self.model(dropped_edge_index, dropped_edge_type, dropped_edge_conf)
-                mu_v2, _ = self.model.predict(z_dropped[h_idx], r_idx, z_dropped[t_idx])
-
-            # (1) Consistency loss: View 1 chases View 2 (detached), no GT needed
-            loss_consistency = torch.mean((mu_v1 - mu_v2.detach()) ** 2)
-
-            # (2) Heteroscedastic pseudo-label loss: structure-aware target drives learning
-            loss_pseudo = torch.mean(
-                ((target_conf.detach() - mu_v1) ** 2) / (sigma_v1 + 1e-6)
-                + torch.log(sigma_v1 + 1e-6)
-            )
-
-            # (3) Base outer-constraint loss: use GT confidences on shared-entity base edges
+            # Sole supervision: base GT on shared-entity edges
             if replay_mask.any():
                 replay_edges = base_edge_idx[:, replay_mask]
                 replay_rels = base_edge_type[replay_mask]
-                replay_conf = base_edge_conf[replay_mask]
+                replay_conf_gt = base_edge_conf[replay_mask]
                 mu_base_pred, _ = self.model.predict(
-                    z_normal[replay_edges[0]], replay_rels, z_normal[replay_edges[1]]
+                    z[replay_edges[0]], replay_rels, z[replay_edges[1]]
                 )
-                loss_base = F.mse_loss(mu_base_pred, replay_conf)
+                loss_base = F.mse_loss(mu_base_pred, replay_conf_gt)
             else:
                 loss_base = torch.tensor(0.0, device=self.device)
 
-            # (4) Embedding anchor regularisation (prevent catastrophic forgetting)
-            curr_z = self.model.entity_emb.weight
+            # Embedding anchor regularisation (prevent catastrophic forgetting)
+            curr_emb = self.model.entity_emb.weight
             loss_reg = lambda_reg * torch.mean(
-                (curr_z[:base_num_ent] - old_emb_snapshot[:base_num_ent]) ** 2
+                (curr_emb[:base_num_ent] - old_emb_snapshot[:base_num_ent]) ** 2
             )
 
-            # (5) MLP anchor regularisation (keep unfrozen MLP head close to base model)
+            # MLP anchor regularisation (keep unfrozen head close to base model)
             loss_mlp_anchor = torch.tensor(0.0, device=self.device)
             for name, param in self.model.mlp_mean.named_parameters():
                 if param.requires_grad and name in old_mlp_params:
                     loss_mlp_anchor = loss_mlp_anchor + torch.mean((param - old_mlp_params[name]) ** 2)
             loss_mlp_anchor = mlp_anchor_coeff * loss_mlp_anchor
 
-            # Dynamic weight schedule: early steps trust pseudo-label more (direction),
-            # later steps trust consistency more (stability)
-            pseudo_weight = max(0.3, 1.0 - step / max(1, em_steps - 1))
-            consistency_weight = 1.0 - pseudo_weight
-
-            loss_total = (
-                pseudo_weight * loss_pseudo
-                + consistency_weight * loss_consistency
-                + alpha_base * loss_base
-                + loss_reg
-                + loss_mlp_anchor
-            )
+            loss_total = alpha_base * loss_base + loss_reg + loss_mlp_anchor
             loss_total.backward()
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
 
-            # EMA update: pseudo label gradually moves toward model prediction
-            with torch.no_grad():
-                momentum = 0.9 - 0.4 * (step / max(1, em_steps - 1))  # 0.9 → 0.5
-                target_conf = momentum * target_conf + (1 - momentum) * mu_v1.detach()
+        # Final prediction for new facts using fine-tuned embeddings
+        self.model.eval()
+        with torch.no_grad():
+            z_final = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
+            new_mu, new_sigma = self.model.predict(z_final[h_idx], r_idx, z_final[t_idx])
 
-            # Refresh edge_conf for new facts using the updated model
-            with torch.no_grad():
-                z_updated = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
-                mu_updated, _ = self.model.predict(z_updated[h_idx], r_idx, z_updated[t_idx])
-                combined_edge_conf = torch.cat([base_edge_conf, mu_updated.detach()], dim=0)
-
-        # Fallback if em_steps == 0
-        if mu_v1 is None:
-            self.model.eval()
-            with torch.no_grad():
-                z = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
-                mu_v1, sigma_v1 = self.model.predict(z[h_idx], r_idx, z[t_idx])
-
-        return mu_v1.detach(), sigma_v1.detach()
+        return new_mu.detach(), new_sigma.detach()
 
     def _compute_causal_influence(self, base_edge_idx, base_edge_type, base_edge_conf, mu_without, h_idx, r_idx, t_idx, new_mu, new_sigma_sq):
         self.model.eval()
