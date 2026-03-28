@@ -55,7 +55,16 @@ from run_incremental import run_incremental_update
 
 def _get_default_model_args():
     """Return an argparse.Namespace with all config.py defaults (no sys.argv)."""
-    return _get_config_args(argv=[])
+    args = _get_config_args(argv=[])
+    args.data_dir = _sanitize_data_dir(args.data_dir)
+    return args
+
+
+def _sanitize_data_dir(data_dir):
+    """Strip trailing commas, slashes, and whitespace from a data_dir path."""
+    if data_dir is None:
+        return data_dir
+    return data_dir.strip().rstrip(",/\\")
 
 
 def _suppress_output():
@@ -105,19 +114,21 @@ def _run_base_trial(base_args, seeds):
     mse_list = []
     for seed in seeds:
         args = copy.deepcopy(base_args)
+        args.data_dir = _sanitize_data_dir(args.data_dir)
         _set_seed(args, seed)
         args.tuning_mode = True
         try:
             with _SuppressAll():
                 metrics = train_base(args)
-            if metrics is None:
-                return LARGE_PENALTY
-            mse = metrics.get("MSE", LARGE_PENALTY)
-            if not _is_finite(mse):
-                return LARGE_PENALTY
-            mse_list.append(mse)
-        except Exception:
+        except Exception as e:
+            print(f"  [WARN] Base trial failed: {e}")
             return LARGE_PENALTY
+        if metrics is None:
+            return LARGE_PENALTY
+        mse = metrics.get("MSE", LARGE_PENALTY)
+        if not _is_finite(mse):
+            return LARGE_PENALTY
+        mse_list.append(mse)
     return sum(mse_list) / len(mse_list) if mse_list else LARGE_PENALTY
 
 
@@ -129,30 +140,33 @@ def _run_inc_trial(base_args, seeds, base_weight_path=None):
     obj_list = []
     for seed in seeds:
         args = copy.deepcopy(base_args)
+        args.data_dir = _sanitize_data_dir(args.data_dir)
         _set_seed(args, seed)
         args.tuning_mode = True
 
         # Ensure checkpoint exists at the expected path
         dataset_name = os.path.basename(os.path.normpath(args.data_dir))
         expected_ckpt = f"checkpoints/base_model_{dataset_name}.pth"
-        if base_weight_path and base_weight_path != expected_ckpt:
+        if base_weight_path and os.path.normpath(base_weight_path) != os.path.normpath(expected_ckpt):
             try:
                 _safe_copy_checkpoint(base_weight_path, expected_ckpt)
-            except Exception:
+            except Exception as e:
+                print(f"  [WARN] Failed to copy checkpoint: {e}")
                 return LARGE_PENALTY
 
         try:
             with _SuppressAll():
                 result = run_incremental_update(args)
-            if result is None:
-                return LARGE_PENALTY
-            inc_mse = result.get("inc_test", {}).get("MSE", LARGE_PENALTY)
-            base_mse = result.get("base_test", {}).get("MSE", LARGE_PENALTY)
-            if not (_is_finite(inc_mse) and _is_finite(base_mse)):
-                return LARGE_PENALTY
-            obj_list.append(inc_mse + 0.3 * base_mse)
-        except Exception:
+        except Exception as e:
+            print(f"  [WARN] Trial failed: {e}")
             return LARGE_PENALTY
+        if result is None:
+            return LARGE_PENALTY
+        inc_mse = result.get("inc_test", {}).get("MSE", LARGE_PENALTY)
+        base_mse = result.get("base_test", {}).get("MSE", LARGE_PENALTY)
+        if not (_is_finite(inc_mse) and _is_finite(base_mse)):
+            return LARGE_PENALTY
+        obj_list.append(inc_mse + 0.3 * base_mse)
     return sum(obj_list) / len(obj_list) if obj_list else LARGE_PENALTY
 
 
@@ -377,7 +391,7 @@ def run_stage(stage, tune_args, model_base_args):
 
     print(f"\n{'#'*60}")
     print(f"  Tuning stage: {stage.upper()}  |  mode: {tune_args.mode}")
-    print(f"  Seeds: {seeds}  |  data_dir: {tune_args.data_dir}")
+    print(f"  Seeds: {seeds}  |  data_dir: {model_base_args.data_dir}")
     print(f"{'#'*60}")
 
     if tune_args.mode == "optuna":
@@ -460,9 +474,10 @@ def main():
     # Build base model args from config defaults (no sys.argv)
     model_base_args = _get_default_model_args()
 
-    # Override data_dir if provided
+    # Override data_dir if provided, then sanitize
     if tune_args.data_dir is not None:
         model_base_args.data_dir = tune_args.data_dir
+    model_base_args.data_dir = _sanitize_data_dir(model_base_args.data_dir)
 
     # Check Optuna availability early
     if tune_args.mode == "optuna" and not OPTUNA_AVAILABLE:
@@ -486,7 +501,7 @@ def main():
             # When running "all" stages, the base stage above will have saved a checkpoint
             # at the expected location already.  Only copy when an explicit path is given
             # and it differs from the expected location.
-            if src_path and src_path != expected_ckpt:
+            if src_path and os.path.normpath(src_path) != os.path.normpath(expected_ckpt):
                 if not os.path.exists(src_path):
                     print(f"ERROR: --base_weight_path '{src_path}' does not exist.")
                     sys.exit(1)
