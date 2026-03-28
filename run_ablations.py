@@ -19,7 +19,8 @@ def run_ablation_experiments(args):
         "wo_causal",     # 变体 1: 移除受影响子图判定
         "wo_bayes",      # 变体 2: 移除贝叶斯信念融合
         "wo_kd",         # 变体 3: 移除未受影响区域全局 KD 保护
-        "wo_em_freeze"   # 变体 4: 移除 EM 阶段基座物理冻结
+        "wo_em_freeze",  # 变体 4: 移除 EM 阶段基座物理冻结
+        "wo_link_pred",  # 变体 5: 移除链接预测自监督损失
     ]
     
     results = []
@@ -124,7 +125,8 @@ def run_ablation_experiments(args):
         "wo_causal": "w/o Causal Filter",
         "wo_bayes": "w/o Bayesian Filter",
         "wo_kd": "w/o Global KD Protect",
-        "wo_em_freeze": "w/o EM Base Freeze"
+        "wo_em_freeze": "w/o EM Base Freeze",
+        "wo_link_pred": "w/o Link Pred Self-Sup",
     })
     
     print("\n" + "=" * 80)
