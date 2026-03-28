@@ -255,6 +255,7 @@ class UnifiedConfidenceUpdater:
         dynamic_update_interval = getattr(self.args, 'dynamic_update_interval', 2) if self.args else 2
         func_anchor_ratio = getattr(self.args, 'func_anchor_ratio', 0.9) if self.args else 0.9
         alpha_new = getattr(self.args, 'alpha_new_supervision', 0.3) if self.args else 0.3
+        alpha_link_pred = getattr(self.args, 'alpha_link_pred', 0.5) if self.args else 0.5
         base_num_ent = self.dataset.base_num_ent
 
         # ------------------------------------------------------------------
@@ -357,7 +358,13 @@ class UnifiedConfidenceUpdater:
                     loss_mlp_anchor = loss_mlp_anchor + torch.mean((param - old_mlp_params[name]) ** 2)
             loss_mlp_anchor = mlp_anchor_coeff * loss_mlp_anchor
 
-            loss_total = alpha_base * loss_base + loss_new + loss_reg + loss_mlp_anchor
+            # Link prediction self-supervision loss (structural signal via negative sampling)
+            if self.ablation_mode == "wo_link_pred":
+                loss_link_pred = torch.tensor(0.0, device=self.device)
+            else:
+                loss_link_pred = self._negative_sampling_loss(z, h_idx, r_idx, t_idx)
+
+            loss_total = alpha_base * loss_base + loss_new + loss_reg + loss_mlp_anchor + alpha_link_pred * loss_link_pred
             loss_total.backward()
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
@@ -379,6 +386,67 @@ class UnifiedConfidenceUpdater:
             new_mu, new_sigma = self.model.predict(z_final[h_idx], r_idx, z_final[t_idx])
 
         return new_mu.detach(), new_sigma.detach()
+
+    def _negative_sampling_loss(self, z, h_idx, r_idx, t_idx):
+        """Compute margin-based link prediction self-supervision loss via negative sampling.
+
+        For each positive fact (h, r, t), samples num_neg_samples corrupted tails and heads
+        from [0, base_num_ent) and computes a margin ranking loss:
+            loss += max(0, margin - s_pos + s_neg)
+        """
+        num_neg = getattr(self.args, 'num_neg_samples', 5) if self.args else 5
+        margin = getattr(self.args, 'link_pred_margin', 0.3) if self.args else 0.3
+        base_num_ent = self.dataset.base_num_ent
+
+        n = h_idx.size(0)
+
+        # Positive scores — differentiable
+        pos_scores, _ = self.model.predict(z[h_idx], r_idx, z[t_idx])  # (n,)
+
+        # Sample negative indices outside gradient computation
+        with torch.no_grad():
+            # Tail corruptions: replace t with t' from [0, base_num_ent), t' != t
+            neg_t_idx = torch.randint(0, base_num_ent, (n, num_neg), device=self.device)
+            t_expanded = t_idx.unsqueeze(1).expand_as(neg_t_idx)
+            collision_t = (neg_t_idx == t_expanded)
+            # Shift collisions by a fixed offset to avoid the same index; guaranteed != t
+            neg_t_idx = torch.where(
+                collision_t,
+                (neg_t_idx + base_num_ent // 2) % base_num_ent,
+                neg_t_idx,
+            )
+
+            # Head corruptions: replace h with h' from [0, base_num_ent), h' != h
+            neg_h_idx = torch.randint(0, base_num_ent, (n, num_neg), device=self.device)
+            h_expanded = h_idx.unsqueeze(1).expand_as(neg_h_idx)
+            collision_h = (neg_h_idx == h_expanded)
+            neg_h_idx = torch.where(
+                collision_h,
+                (neg_h_idx + base_num_ent // 2) % base_num_ent,
+                neg_h_idx,
+            )
+
+        # Compute negative scores in a single batched call per corruption type
+        # neg_t_idx: (n, num_neg) → flatten to (n*num_neg,), score, then reshape
+        neg_t_flat = neg_t_idx.reshape(-1)  # (n * num_neg,)
+        h_rep = h_idx.unsqueeze(1).expand(n, num_neg).reshape(-1)
+        r_rep = r_idx.unsqueeze(1).expand(n, num_neg).reshape(-1)
+
+        neg_scores_t, _ = self.model.predict(z[h_rep], r_rep, z[neg_t_flat])  # (n*num_neg,)
+        neg_scores_t = neg_scores_t.reshape(n, num_neg)  # (n, num_neg)
+
+        neg_h_flat = neg_h_idx.reshape(-1)
+        t_rep = t_idx.unsqueeze(1).expand(n, num_neg).reshape(-1)
+
+        neg_scores_h, _ = self.model.predict(z[neg_h_flat], r_rep, z[t_rep])  # (n*num_neg,)
+        neg_scores_h = neg_scores_h.reshape(n, num_neg)  # (n, num_neg)
+
+        # Margin ranking loss: max(0, margin - s_pos + s_neg)
+        pos_expanded = pos_scores.unsqueeze(1)  # (n, 1)
+        loss_t = torch.clamp(margin - pos_expanded + neg_scores_t, min=0.0).mean()
+        loss_h = torch.clamp(margin - pos_expanded + neg_scores_h, min=0.0).mean()
+
+        return (loss_t + loss_h) / 2.0
 
     def _compute_causal_influence(self, base_edge_idx, base_edge_type, base_edge_conf, mu_without, h_idx, r_idx, t_idx, new_mu, new_sigma_sq):
         self.model.eval()
