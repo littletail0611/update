@@ -39,9 +39,10 @@ def get_args(argv=None):
     parser.add_argument("--mlp_anchor_coeff", type=float, default=0.01, help="MLP anchor regularization coefficient")
     parser.add_argument("--finetune_steps", type=int, default=5, help="Fine-tuning steps in propagate-then-finetune stage")
     parser.add_argument("--propagation_hops", type=int, default=2, help="Number of hops for label propagation")
-    parser.add_argument("--soft_label_weight", type=float, default=0.5, help="Weight for sigma-weighted soft supervision loss on new facts")
     parser.add_argument("--dynamic_update_interval", type=int, default=2, help="Update pseudo-label every N finetune steps (0 to disable)")
     parser.add_argument("--func_anchor_ratio", type=float, default=0.9, help="Blend ratio for functional anchoring: func_anchor_ratio * functional_loss + (1 - func_anchor_ratio) * weak_absolute_L2")
+    parser.add_argument("--alpha_new_supervision", type=float, default=0.3,
+                        help="Weight for new-fact pseudo-label supervision in fine-tuning")
 
     # ================= 6. 调参模式 =================
     parser.add_argument("--tuning_mode", action="store_true", default=False, help="Enable tuning mode: suppresses verbose console output during hyperparameter search")
