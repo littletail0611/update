@@ -29,7 +29,7 @@ def get_args(argv=None):
     parser.add_argument("--gamma", type=float, default=0.8, help="因果影响多跳传播的衰减因子")
     parser.add_argument("--num_hops", type=int, default=2, help="因果影响传播的最大跳数")
     parser.add_argument("--epsilon", type=float, default=1e-4, help="贝叶斯滤波中防止除零的平滑项")
-    parser.add_argument("--influence_threshold", type=float, default=0.03, help="判定旧事实受影响的阈值")
+    parser.add_argument("--influence_threshold", type=float, default=0.001, help="判定旧事实受影响的阈值")
     parser.add_argument("--lambda_reg", type=float, default=0.1, help="防止灾难性遗忘的锚点正则化权重")
     parser.add_argument("--refine_steps", type=int, default=3, help="受影响局部子图的微调步数")
 
@@ -37,15 +37,15 @@ def get_args(argv=None):
     parser.add_argument("--edge_drop_rate", type=float, default=0.2, help="Edge dropout ratio (deprecated: kept for backward compatibility, no longer used)")
     parser.add_argument("--alpha_base", type=float, default=1.0, help="Weight for base outer-constraint loss")
     parser.add_argument("--mlp_anchor_coeff", type=float, default=0.01, help="MLP anchor regularization coefficient")
-    parser.add_argument("--finetune_steps", type=int, default=3, help="Fine-tuning steps in propagate-then-finetune stage")
+    parser.add_argument("--finetune_steps", type=int, default=8, help="Fine-tuning steps in propagate-then-finetune stage")
     parser.add_argument("--propagation_hops", type=int, default=2, help="Number of hops for label propagation")
     parser.add_argument("--dynamic_update_interval", type=int, default=2, help="Update pseudo-label every N finetune steps (0 to disable)")
     parser.add_argument("--func_anchor_ratio", type=float, default=0.9, help="Blend ratio for functional anchoring: func_anchor_ratio * functional_loss + (1 - func_anchor_ratio) * weak_absolute_L2")
     parser.add_argument("--alpha_new_supervision", type=float, default=0.3,
                         help="Weight for new-fact pseudo-label supervision in fine-tuning")
-    parser.add_argument("--num_neg_samples", type=int, default=5, help="Number of negative samples per positive for link prediction self-supervision")
-    parser.add_argument("--link_pred_margin", type=float, default=0.3, help="Margin for link prediction ranking loss")
-    parser.add_argument("--alpha_link_pred", type=float, default=0.5, help="Weight for link prediction self-supervision loss")
+    parser.add_argument("--num_neg_samples", type=int, default=5, help="(deprecated: link prediction loss removed) Number of negative samples per positive for link prediction self-supervision")
+    parser.add_argument("--link_pred_margin", type=float, default=0.3, help="(deprecated: link prediction loss removed) Margin for link prediction ranking loss")
+    parser.add_argument("--alpha_link_pred", type=float, default=0.5, help="(deprecated: link prediction loss removed) Weight for link prediction self-supervision loss")
 
     # ================= 6. 调参模式 =================
     parser.add_argument("--tuning_mode", action="store_true", default=False, help="Enable tuning mode: suppresses verbose console output during hyperparameter search")

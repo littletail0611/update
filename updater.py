@@ -29,12 +29,12 @@ class UnifiedConfidenceUpdater:
         r_idx = torch.tensor([f[1] for f in new_facts_batch], dtype=torch.long, device=self.device)
         t_idx = torch.tensor([f[2] for f in new_facts_batch], dtype=torch.long, device=self.device)
 
-        self._init_new_entities(h_idx, r_idx, t_idx)
-
         base_edge_idx, base_edge_type, base_edge_conf = self.dataset.get_base_graph_data()
         base_edge_idx = base_edge_idx.to(self.device)
         base_edge_type = base_edge_type.to(self.device)
         base_edge_conf = base_edge_conf.to(self.device)
+
+        self._init_new_entities(h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf)
 
         self.model.eval()
         with torch.no_grad():
@@ -46,7 +46,7 @@ class UnifiedConfidenceUpdater:
 
         # 1. Propagate-then-finetune stage (deterministic label propagation + base-GT-only fine-tuning)
         raw_new_mu, new_sigma_sq = self._propagate_then_finetune(h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf)
-        new_mu = self._relation_aware_calibration(raw_new_mu, new_sigma_sq, r_idx, base_edge_type, base_edge_conf)
+        new_mu = raw_new_mu
 
         # Recompute mu_without on the post-finetune model so causal influence assessment
         # compares "base-graph-after-finetune" vs "combined-graph-after-finetune", preventing
@@ -79,88 +79,69 @@ class UnifiedConfidenceUpdater:
         change_tensor = torch.abs(c_new - c_old)
         return new_mu.detach(), change_tensor.mean().item(), change_tensor.max().item(), real_affected_count
 
-    def _init_new_entities(self, h_idx, r_idx, t_idx):
+    def _init_new_entities(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf):
+        """Initialize new entity embeddings using GNN message passing.
+
+        Step 1: Seed each new entity's raw embedding as the mean of its old-entity
+                neighbours' raw embeddings (rough geometric prior).
+        Step 2: Build a combined graph with propagated_conf as new-edge confidences,
+                run one GNN forward pass, and overwrite each new entity's raw embedding
+                with the GNN-aggregated output so the starting point respects the model's
+                own aggregation scheme.
+        """
+        new_ents = self.dataset.new_entities
+        if not new_ents:
+            return
+
         with torch.no_grad():
             ent_weight = self.model.entity_emb.weight
-            rel_weight = self.model.relation_emb.weight
-            new_ents = self.dataset.new_entities
+            new_ents_tensor = torch.tensor(list(new_ents), dtype=torch.long, device=self.device)
 
-            # Build a tensor of new entity IDs for vectorized membership checks
-            if new_ents:
-                new_ents_tensor = torch.tensor(list(new_ents), dtype=torch.long, device=self.device)
-            else:
-                new_ents_tensor = torch.empty(0, dtype=torch.long, device=self.device)
-
+            # ----------------------------------------------------------------
+            # Step 1: seed new entity embeddings as mean of old-entity neighbours
+            # ----------------------------------------------------------------
             for ent_id in new_ents:
-                msgs = []
-                # As head entity: h=ent_id, neighbor is t, relation r
+                neighbor_embs = []
+
                 mask_h = (h_idx == ent_id)
                 if mask_h.any():
                     t_neighbors = t_idx[mask_h]
-                    r_neighbors = r_idx[mask_h]
                     old_mask = ~torch.isin(t_neighbors, new_ents_tensor)
                     if old_mask.any():
-                        msgs.append((ent_weight[t_neighbors[old_mask]] - rel_weight[r_neighbors[old_mask]]).mean(dim=0))
+                        neighbor_embs.append(ent_weight[t_neighbors[old_mask]].mean(dim=0))
 
-                # As tail entity: t=ent_id, neighbor is h, relation r
                 mask_t = (t_idx == ent_id)
                 if mask_t.any():
                     h_neighbors = h_idx[mask_t]
-                    r_neighbors = r_idx[mask_t]
                     old_mask = ~torch.isin(h_neighbors, new_ents_tensor)
                     if old_mask.any():
-                        msgs.append((ent_weight[h_neighbors[old_mask]] + rel_weight[r_neighbors[old_mask]]).mean(dim=0))
+                        neighbor_embs.append(ent_weight[h_neighbors[old_mask]].mean(dim=0))
 
-                if msgs:
-                    ent_weight[ent_id] = torch.stack(msgs).mean(dim=0)
+                if neighbor_embs:
+                    ent_weight[ent_id] = torch.stack(neighbor_embs).mean(dim=0)
                 else:
-                    # Fallback: average all neighbors if no old-entity neighbors available
-                    neighbors = []
-                    if mask_h.any():
-                        neighbors.extend(t_idx[mask_h].tolist())
-                    if mask_t.any():
-                        neighbors.extend(h_idx[mask_t].tolist())
-                    if neighbors:
-                        neighbor_tensor = torch.tensor(neighbors, dtype=torch.long, device=self.device)
-                        ent_weight[ent_id] = ent_weight[neighbor_tensor].mean(dim=0)
+                    # Fallback: overall base-entity mean when isolated from old graph
+                    if self.dataset.base_num_ent > 0:
+                        ent_weight[ent_id] = ent_weight[:self.dataset.base_num_ent].mean(dim=0)
 
-    def _relation_aware_calibration(self, new_mu, new_sigma_sq, r_idx,
-                                     base_edge_type, base_edge_conf):
-        """Calibrate model predictions for new facts using relation-level priors.
-        
-        For each new fact (h, r, t):
-            calibrated_mu = w * new_mu + (1 - w) * prior_mu_r
-            where w = model_precision / (model_precision + prior_precision)
-        """
-        calibrated = torch.zeros_like(new_mu)
-        
-        # Precompute per-relation statistics from base graph
-        r_stats = {}
-        for r_val in base_edge_type.unique().tolist():
-            mask = (base_edge_type == r_val)
-            confs = base_edge_conf[mask]
-            r_stats[r_val] = {
-                'mean': confs.mean().item(),
-                'var': confs.var().item() if confs.numel() > 1 else 0.1,
-                'count': confs.numel()
-            }
-        
-        global_mean = base_edge_conf.mean().item() if base_edge_conf.numel() > 0 else 0.5
-        global_var = base_edge_conf.var().item() if base_edge_conf.numel() > 1 else 0.1
-        
-        for i in range(new_mu.shape[0]):
-            r = r_idx[i].item()
-            stats = r_stats.get(r, {'mean': global_mean, 'var': global_var, 'count': 1})
-            
-            prior_mu = stats['mean']
-            prior_precision = 1.0 / (stats['var'] + 1e-6)
-            model_precision = 1.0 / (new_sigma_sq[i].item() + 1e-6)
-            
-            # Bayesian precision weighting
-            w = model_precision / (model_precision + prior_precision)
-            calibrated[i] = w * new_mu[i] + (1 - w) * prior_mu
-        
-        return calibrated
+            # ----------------------------------------------------------------
+            # Step 2: one GNN forward pass with propagated_conf on new edges;
+            #         overwrite new entity embeddings with GNN-aggregated output
+            # ----------------------------------------------------------------
+            propagated_conf = self._label_propagation(
+                h_idx, r_idx, t_idx,
+                base_edge_idx, base_edge_type, base_edge_conf,
+                hops=2,
+            )
+
+            new_edge_index = torch.stack([h_idx, t_idx], dim=0)
+            combined_edge_index = torch.cat([base_edge_idx, new_edge_index], dim=1)
+            combined_edge_type = torch.cat([base_edge_type, r_idx], dim=0)
+            combined_edge_conf = torch.cat([base_edge_conf, propagated_conf], dim=0)
+
+            self.model.eval()
+            z = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
+            ent_weight[new_ents_tensor] = z[new_ents_tensor].clone()
 
     def _label_propagation(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf, hops=2):
         """Deterministic label propagation from base GT to new facts. No model involved.
@@ -262,7 +243,6 @@ class UnifiedConfidenceUpdater:
         dynamic_update_interval = getattr(self.args, 'dynamic_update_interval', 2) if self.args else 2
         func_anchor_ratio = getattr(self.args, 'func_anchor_ratio', 0.9) if self.args else 0.9
         alpha_new = getattr(self.args, 'alpha_new_supervision', 0.3) if self.args else 0.3
-        alpha_link_pred = getattr(self.args, 'alpha_link_pred', 0.5) if self.args else 0.5
         base_num_ent = self.dataset.base_num_ent
 
         # ------------------------------------------------------------------
@@ -365,12 +345,7 @@ class UnifiedConfidenceUpdater:
                     loss_mlp_anchor = loss_mlp_anchor + torch.mean((param - old_mlp_params[name]) ** 2)
             loss_mlp_anchor = mlp_anchor_coeff * loss_mlp_anchor
 
-            if self.ablation_mode != "wo_link_pred":
-                loss_link_pred = self._negative_sampling_loss(z, h_idx, r_idx, t_idx)
-            else:
-                loss_link_pred = torch.tensor(0.0, device=self.device)
-
-            loss_total = alpha_base * loss_base + loss_new + loss_reg + loss_mlp_anchor + alpha_link_pred * loss_link_pred
+            loss_total = alpha_base * loss_base + loss_new + loss_reg + loss_mlp_anchor
             loss_total.backward()
 
             # Zero out gradients for entities not involved in new facts or their
@@ -429,7 +404,6 @@ class UnifiedConfidenceUpdater:
             confounder_penalty = 1.0 / torch.log2(target_degrees + 2.0)
 
             S_tau = ITE * intervention_reliability * confounder_penalty * self.gamma
-            S_tau = torch.where(S_tau < 1e-4, torch.zeros_like(S_tau), S_tau)
 
         return S_tau, mu_with, sigma_sq_old
 
@@ -534,59 +508,6 @@ class UnifiedConfidenceUpdater:
             optimizer.step()
 
         return real_affected_count
-
-    def _negative_sampling_loss(self, z, h_idx, r_idx, t_idx):
-        """Margin-based ranking loss using link prediction self-supervision.
-
-        For each new fact (h, r, t):
-          - Positive: s_pos = model.predict(z[h], r, z[t])
-          - Tail-replaced negatives: (h, r, t') with t' sampled from [0, num_ent)
-          - Head-replaced negatives: (h', r, t) with h' sampled from [0, num_ent)
-          - Loss: mean( max(0, margin - s_pos + s_neg) )
-
-        Negatives are sampled from the full entity pool [0, num_ent) including new
-        entities, so the model learns to discriminate real facts from random
-        combinations across the entire entity space.
-        """
-        num_ent = self.dataset.num_ent
-        num_neg = getattr(self.args, 'num_neg_samples', 5) if self.args else 5
-        margin = getattr(self.args, 'link_pred_margin', 0.3) if self.args else 0.3
-
-        batch_size = h_idx.size(0)
-
-        # Positive scores — shape (B,)
-        s_pos, _ = self.model.predict(z[h_idx], r_idx, z[t_idx])
-
-        with torch.no_grad():
-            # Collision-free sampling: sample from [0, num_ent-1) then shift values
-            # that are >= the true entity index, guaranteeing no collision without
-            # introducing modulo wrap-around issues.
-
-            # Tail-entity replacement — (B, num_neg)
-            t_neg = torch.randint(0, num_ent - 1, (batch_size, num_neg), device=self.device)
-            t_neg[t_neg >= t_idx.unsqueeze(1)] += 1
-
-            # Head-entity replacement — (B, num_neg)
-            h_neg = torch.randint(0, num_ent - 1, (batch_size, num_neg), device=self.device)
-            h_neg[h_neg >= h_idx.unsqueeze(1)] += 1
-
-        # Expand positive inputs for batched negative scoring — (B * num_neg,)
-        h_exp = h_idx.unsqueeze(1).expand(batch_size, num_neg).reshape(-1)
-        t_exp = t_idx.unsqueeze(1).expand(batch_size, num_neg).reshape(-1)
-        r_exp = r_idx.unsqueeze(1).expand(batch_size, num_neg).reshape(-1)
-        s_pos_exp = s_pos.unsqueeze(1).expand(batch_size, num_neg).reshape(-1)
-
-        # Tail-replacement negatives — one batched predict call
-        t_neg_flat = t_neg.reshape(-1)
-        s_neg_tail, _ = self.model.predict(z[h_exp], r_exp, z[t_neg_flat])
-        loss_tail = torch.clamp(margin - s_pos_exp + s_neg_tail, min=0.0)
-
-        # Head-replacement negatives — one batched predict call
-        h_neg_flat = h_neg.reshape(-1)
-        s_neg_head, _ = self.model.predict(z[h_neg_flat], r_exp, z[t_exp])
-        loss_head = torch.clamp(margin - s_pos_exp + s_neg_head, min=0.0)
-
-        return torch.cat([loss_tail, loss_head]).mean()
 
     def _update_dataset_belief(self, base_edge_idx, base_edge_type, updated_beliefs):
         h_list = base_edge_idx[0].cpu().numpy()
