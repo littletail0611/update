@@ -154,133 +154,126 @@ class UnifiedConfidenceUpdater:
         
         return calibrated
 
-    def _label_propagation(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf, tau=0.1):
+    @staticmethod
+    def _make_selective_grad_hook(update_mask):
+        """Return a gradient hook that zeroes out gradients for entities not in update_mask.
+
+        The incoming gradient tensor must be cloned before masking because PyTorch
+        autograd forbids in-place modification of gradient leaf tensors.
         """
-        全张量化、基于关系感知的注意力标签传播 (无任何 for 循环)
+        def hook(grad):
+            grad_clone = grad.clone()
+            grad_clone[~update_mask] = 0.0
+            return grad_clone
+        return hook
+
+    def _few_shot_confidence_init(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf, top_k=10, tau=0.1):
+        """Few-shot inspired confidence initialization for new facts.
+
+        For each new fact (h, r, t), finds old facts with the SAME relation r that are
+        semantically similar (measured by cosine similarity of the entity-pair embedding
+        sum h_emb + t_emb), then aggregates their confidences via softmax-weighted sum.
+
+        Falls back to the global mean confidence when no same-relation old facts exist.
         """
-        # 1. 拓扑寻址：构建新事实与旧图谱边的连接矩阵 [N, E]
-        # h_idx: [N, 1], base_edge_idx[0/1]: [1, E] -> 广播比较生成 mask
-        h_match = (h_idx.unsqueeze(1) == base_edge_idx[0].unsqueeze(0)) | \
-                  (h_idx.unsqueeze(1) == base_edge_idx[1].unsqueeze(0))
-        t_match = (t_idx.unsqueeze(1) == base_edge_idx[0].unsqueeze(0)) | \
-                  (t_idx.unsqueeze(1) == base_edge_idx[1].unsqueeze(0))
-        
-        # connected_mask[i, j] = True 表示第 i 个新事实与第 j 条旧边相连 (1-hop 邻居)
-        connected_mask = h_match | t_match  # Shape: [N, E]
-
-        # 2. 语义注意力：计算关系特征的相似度
-        # 提取并 L2 归一化关系 Embedding
-        r_new_norm = F.normalize(self.model.relation_emb(r_idx), p=2, dim=-1)       # [N, D]
-        r_base_norm = F.normalize(self.model.relation_emb(base_edge_type), p=2, dim=-1) # [E, D]
-
-        # 通过高效的矩阵乘法直接得到所有新旧关系对的余弦相似度矩阵 [N, E]
-        sim_matrix = torch.mm(r_new_norm, r_base_norm.t())
-
-        # 引入温度系数 tau 缩放 logits，控制注意力的锐度
-        attn_logits = sim_matrix / tau
-
-        # 3. 掩码与归一化：屏蔽无拓扑连接的边，应用 Softmax
-        # 将不相连的边的 logit 设为负无穷，这样经过 softmax 后权重就严格为 0
-        attn_logits = attn_logits.masked_fill(~connected_mask, float('-inf'))
-        
-        # 按行 (每个新事实) 计算注意力权重
-        attn_weights = F.softmax(attn_logits, dim=1)  # Shape: [N, E]
-        
-        # 对于没有任何邻居的孤立节点，softmax 会因为全是 -inf 产生 NaN，将其替换为 0
-        attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
-
-        # 4. 信息聚合：用注意力权重对旧边置信度进行加权求和
-        # [N, E] * [1, E] -> 按行求和 -> [N]
-        propagated_conf = torch.sum(attn_weights * base_edge_conf.unsqueeze(0), dim=1)
-
-        # 5. 孤立节点 Fallback 机制：退化为全局平均置信度
-        has_neighbors = connected_mask.any(dim=1)
+        N = h_idx.shape[0]
+        propagated_conf = torch.zeros(N, dtype=torch.float, device=self.device)
         global_mean = base_edge_conf.mean() if base_edge_conf.numel() > 0 else torch.tensor(0.5, device=self.device)
-        propagated_conf = torch.where(has_neighbors, propagated_conf, global_mean)
+
+        ent_weight = self.model.entity_emb.weight
+
+        for i in range(N):
+            r = r_idx[i].item()
+            # Find old facts with the same relation
+            same_rel_mask = (base_edge_type == r)
+            if not same_rel_mask.any():
+                propagated_conf[i] = global_mean
+                continue
+
+            same_rel_h = base_edge_idx[0][same_rel_mask]
+            same_rel_t = base_edge_idx[1][same_rel_mask]
+            same_rel_confs = base_edge_conf[same_rel_mask]
+
+            # Semantic similarity via entity-pair embedding: L2-normalised (h+t) cosine sim
+            new_feat = F.normalize(
+                (ent_weight[h_idx[i]] + ent_weight[t_idx[i]]).unsqueeze(0), p=2, dim=-1
+            )  # [1, D]
+            old_feat = F.normalize(
+                ent_weight[same_rel_h] + ent_weight[same_rel_t], p=2, dim=-1
+            )  # [K, D]
+
+            sim = torch.mm(new_feat, old_feat.t()).squeeze(0)  # [K]
+
+            # Select top-k most semantically similar same-relation old facts
+            k = min(top_k, sim.shape[0])
+            topk_sim, topk_idx = torch.topk(sim, k)
+
+            # Softmax-weighted confidence aggregation
+            weights = F.softmax(topk_sim / tau, dim=0)
+            propagated_conf[i] = (weights * same_rel_confs[topk_idx]).sum()
 
         return propagated_conf
 
     def _propagate_then_finetune(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf):
-        """Two-phase approach: deterministic label propagation then base-GT-only fine-tuning.
+        """Stage 1: Few-shot confidence init + new-entity-only fine-tuning.
 
-        Phase 1 (no gradients, no model):
-            Compute propagated_conf for new edges via _label_propagation.
+        Phase 1 (no gradients):
+            Initialize new-fact confidences via _few_shot_confidence_init:
+            for each new fact, find same-relation old facts that are semantically
+            similar (entity-pair cosine sim) and aggregate their confidences.
 
-        Phase 2 (with gradients, GT supervision only):
-            Fine-tune entity_emb (+ unfrozen mlp_mean last layer) using MSE against base GT
-            on edges that share at least one entity with the new facts.
-            No consistency loss, no pseudo-label loss.
+        Phase 2 (Stage 1 fine-tuning):
+            Only train on new facts; old entity embeddings are frozen via a
+            gradient hook so they receive no gradient updates.  Only new entity
+            representations (IDs >= base_num_ent) are learned here.
 
-        Returns (new_mu, new_sigma) predicted after fine-tuning.
+        Returns (new_mu, new_sigma) predicted after Stage 1 fine-tuning.
         """
-        propagation_hops = getattr(self.args, 'propagation_hops', 2) if self.args else 2
         finetune_steps = getattr(self.args, 'finetune_steps', 5) if self.args else 5
-        lambda_reg = self.args.lambda_reg if self.args else 0.001
-        lambda_reg = min(lambda_reg, 0.01)
-        alpha_base = getattr(self.args, 'alpha_base', 1.0) if self.args else 1.0
         mlp_anchor_coeff = getattr(self.args, 'mlp_anchor_coeff', 0.01) if self.args else 0.01
         dynamic_update_interval = getattr(self.args, 'dynamic_update_interval', 2) if self.args else 2
-        func_anchor_ratio = getattr(self.args, 'func_anchor_ratio', 0.9) if self.args else 0.9
         alpha_new = getattr(self.args, 'alpha_new_supervision', 0.3) if self.args else 0.3
         base_num_ent = self.dataset.base_num_ent
 
         # ------------------------------------------------------------------
-        # Phase 1: Deterministic label propagation (no model, no gradients)
+        # Phase 1: Few-shot inspired confidence initialization for new facts
+        # Find same-relation old facts that are semantically similar and use
+        # their confidences to initialise new-fact confidence values.
         # ------------------------------------------------------------------
-        # with torch.no_grad():
-        #     propagated_conf = self._label_propagation(
-        #         h_idx, r_idx, t_idx,
-        #         base_edge_idx, base_edge_type, base_edge_conf,
-        #         hops=propagation_hops,
-        #     )
         with torch.no_grad():
-            propagated_conf = self._label_propagation(
+            propagated_conf = self._few_shot_confidence_init(
                 h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf
-                # 如果你想调节注意力的锐度，可以加上 tau 参数，例如：tau=0.1
             )
 
-        # Build combined graph using propagated_conf as input confidence for new edges
+        # Build combined graph using few-shot initialised confidence for new edges
         new_edge_index = torch.stack([h_idx, t_idx], dim=0)
         combined_edge_index = torch.cat([base_edge_idx, new_edge_index], dim=1)
         combined_edge_type = torch.cat([base_edge_type, r_idx], dim=0)
         combined_edge_conf = torch.cat([base_edge_conf, propagated_conf], dim=0)
 
         # ------------------------------------------------------------------
-        # Phase 2: Base-GT-supervised fine-tuning (no pseudo-labels, no consistency loss)
+        # Phase 2: Stage 1 fine-tuning – only learn new entity representations
+        # Old entity embeddings are frozen via a gradient hook (Stage 1 rule:
+        # train only on new facts, only update new entities).
         # ------------------------------------------------------------------
-        # Snapshot embeddings and unfrozen MLP weights for anchor regularisation
-        old_emb_snapshot = self.model.entity_emb.weight.detach().clone()
         old_mlp_params = {
             name: param.detach().clone()
             for name, param in self.model.mlp_mean.named_parameters()
             if param.requires_grad
         }
 
-        # Base edges that share at least one entity with the new facts (replay supervision)
-        new_ents_tensor = torch.cat([h_idx, t_idx]).unique()
-        replay_mask = (
-            torch.isin(base_edge_idx[0], new_ents_tensor) |
-            torch.isin(base_edge_idx[1], new_ents_tensor)
-        )
-
         trainable_params = [self.model.entity_emb.weight]
         trainable_params += [p for p in self.model.mlp_mean.parameters() if p.requires_grad]
         optimizer = optim.Adam(trainable_params, lr=self.lr)
 
-        # Snapshot functional anchor: old model predictions on replay base edges
-        # Used to preserve prediction behaviour rather than absolute embedding positions
-        with torch.no_grad():
-            self.model.eval()
-            if replay_mask.any():
-                z_old_snapshot = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
-                replay_edges_snap = base_edge_idx[:, replay_mask]
-                replay_rels_snap = base_edge_type[replay_mask]
-                mu_old_pred_replay, _ = self.model.predict(
-                    z_old_snapshot[replay_edges_snap[0]], replay_rels_snap, z_old_snapshot[replay_edges_snap[1]]
-                )
-                mu_old_pred_replay = mu_old_pred_replay.detach()
-            else:
-                mu_old_pred_replay = None
+        # Gradient hook: zero out gradients for old entities so only new entity
+        # representations (IDs >= base_num_ent) are updated during Stage 1.
+        n_ents_s1 = self.model.entity_emb.weight.shape[0]
+        stage1_update_mask = torch.zeros(n_ents_s1, dtype=torch.bool, device=self.device)
+        stage1_update_mask[base_num_ent:] = True  # only new entities
+        hook_s1 = self.model.entity_emb.weight.register_hook(
+            self._make_selective_grad_hook(stage1_update_mask)
+        )
 
         self.model.train()
 
@@ -289,47 +282,19 @@ class UnifiedConfidenceUpdater:
 
             z = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
 
-            # Sole supervision: base GT on shared-entity edges
-            if replay_mask.any():
-                replay_edges = base_edge_idx[:, replay_mask]
-                replay_rels = base_edge_type[replay_mask]
-                replay_conf_gt = base_edge_conf[replay_mask]
-                mu_base_pred, _ = self.model.predict(
-                    z[replay_edges[0]], replay_rels, z[replay_edges[1]]
-                )
-                loss_base = F.mse_loss(mu_base_pred, replay_conf_gt)
-            else:
-                loss_base = torch.tensor(0.0, device=self.device)
-
-            # Direct new-fact supervision using propagated_conf as soft labels
+            # Stage 1: supervise only on new facts using few-shot initialised confidences
             mu_new_pred, _ = self.model.predict(z[h_idx], r_idx, z[t_idx])
             ramp = min(1.0, (step_i + 1) / finetune_steps)
             loss_new = alpha_new * ramp * F.mse_loss(mu_new_pred, propagated_conf.detach())
 
-            # Embedding anchor regularisation (prevent catastrophic forgetting)
-            # Functional anchoring: penalise changes in predictions on replay edges
-            # rather than absolute embedding positions. A weak absolute L2 term prevents
-            # degenerate solutions where embeddings drift to infinity.
-            curr_emb = self.model.entity_emb.weight
-            weak_l2 = lambda_reg * (1.0 - func_anchor_ratio) * torch.mean(
-                (curr_emb[:base_num_ent] - old_emb_snapshot[:base_num_ent]) ** 2
-            )
-            if replay_mask.any() and mu_old_pred_replay is not None:
-                # mu_base_pred was computed on the same replay edges just above (lines 286-289);
-                # reuse it as the current predictions for the functional anchor.
-                func_loss = F.mse_loss(mu_base_pred, mu_old_pred_replay)
-                loss_reg = lambda_reg * func_anchor_ratio * func_loss + weak_l2
-            else:
-                loss_reg = weak_l2
-
-            # MLP anchor regularisation (keep unfrozen head close to base model)
+            # MLP anchor: keep prediction head close to base model
             loss_mlp_anchor = torch.tensor(0.0, device=self.device)
             for name, param in self.model.mlp_mean.named_parameters():
                 if param.requires_grad and name in old_mlp_params:
                     loss_mlp_anchor = loss_mlp_anchor + torch.mean((param - old_mlp_params[name]) ** 2)
             loss_mlp_anchor = mlp_anchor_coeff * loss_mlp_anchor
 
-            loss_total = alpha_base * loss_base + loss_new + loss_reg + loss_mlp_anchor
+            loss_total = loss_new + loss_mlp_anchor
             loss_total.backward()
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
@@ -337,14 +302,15 @@ class UnifiedConfidenceUpdater:
 
             # Dynamic pseudo-label update: refresh combined_edge_conf for new facts
             # every dynamic_update_interval steps so the soft target tracks the model.
-            # Skip step 0 — the model hasn't been updated yet at that point.
             if dynamic_update_interval > 0 and step_i > 0 and step_i % dynamic_update_interval == 0:
                 with torch.no_grad():
                     combined_edge_conf = torch.cat(
                         [base_edge_conf, mu_new_pred.detach().clamp(0.0, 1.0)], dim=0
                     )
 
-        # Final prediction for new facts using fine-tuned embeddings
+        hook_s1.remove()
+
+        # Final prediction for new facts using Stage-1-fine-tuned embeddings
         self.model.eval()
         with torch.no_grad():
             z_final = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
@@ -403,14 +369,23 @@ class UnifiedConfidenceUpdater:
         return torch.clamp(c_new, 0.0, 1.0), c_old
 
     def _local_representation_refinement(self, base_edge_idx, base_edge_type, c_new, old_z, S_tau, h_idx, r_idx, t_idx, new_mu):
-        """Elastic rebalancing: fit new knowledge + evolve affected old knowledge + elastic anchor"""
+        """Stage 2: Jointly update new facts and affected old facts with selective entity updates.
+
+        Only updates entity representations that appear in:
+          - All new facts  (h_idx, t_idx)
+          - Affected old facts  (edges with S_tau > threshold)
+
+        Entities that are not in either set remain frozen via a gradient hook.
+        Old entity representations in the affected set are regularised with an L2
+        penalty against their original embeddings (old_z) to prevent excessive drift.
+        """
         threshold = self.args.influence_threshold if self.args else 0.01
         lambda_reg = self.args.lambda_reg if self.args else 0.001
-        # Cap lambda_reg to prevent over-restriction in refinement stage
         lambda_reg = min(lambda_reg, 0.01)
         func_anchor_ratio = getattr(self.args, 'func_anchor_ratio', 0.9) if self.args else 0.9
         alpha = 1.0
         steps = self.args.refine_steps if self.args else 3
+        base_num_ent = self.dataset.base_num_ent
 
         if self.ablation_mode == "wo_causal":
             affected_mask = torch.ones_like(S_tau, dtype=torch.bool)
@@ -419,13 +394,35 @@ class UnifiedConfidenceUpdater:
 
         real_affected_count = affected_mask.sum().item()
 
-        # Snapshot functional anchor: old predictions on affected base edges using old embeddings
+        # Compute entities to update in Stage 2:
+        #   = all entities in new facts  ∪  entities in affected old facts
+        new_ents = torch.cat([h_idx, t_idx]).unique()
+        if affected_mask.any():
+            affected_edges = base_edge_idx[:, affected_mask]
+            affected_old_ents = torch.cat([affected_edges[0], affected_edges[1]]).unique()
+        else:
+            affected_old_ents = torch.empty(0, dtype=torch.long, device=self.device)
+
+        ents_to_update = torch.cat([new_ents, affected_old_ents]).unique()
+
+        # Old entities in affected set (IDs < base_num_ent) – need regularisation
+        if affected_old_ents.numel() > 0:
+            old_ents_for_reg = affected_old_ents[affected_old_ents < base_num_ent]
+        else:
+            old_ents_for_reg = torch.empty(0, dtype=torch.long, device=self.device)
+
+        # Selective gradient mask: only entities in ents_to_update receive gradients
+        n_ents = self.model.entity_emb.weight.shape[0]
+        update_mask = torch.zeros(n_ents, dtype=torch.bool, device=self.device)
+        update_mask[ents_to_update] = True
+
+        # Snapshot old predictions on affected edges for functional anchoring
         with torch.no_grad():
             if affected_mask.any():
-                affected_edges_old = base_edge_idx[:, affected_mask]
-                affected_rels_old = base_edge_type[affected_mask]
+                affected_edges_snap = base_edge_idx[:, affected_mask]
+                affected_rels_snap = base_edge_type[affected_mask]
                 mu_old_affected, _ = self.model.predict(
-                    old_z[affected_edges_old[0]], affected_rels_old, old_z[affected_edges_old[1]]
+                    old_z[affected_edges_snap[0]], affected_rels_snap, old_z[affected_edges_snap[1]]
                 )
                 mu_old_affected = mu_old_affected.detach()
             else:
@@ -434,15 +431,20 @@ class UnifiedConfidenceUpdater:
         self.model.train()
         optimizer = optim.Adam([self.model.entity_emb.weight], lr=self.lr)
 
+        # Gradient hook: only update selected entities (new + affected old)
+        hook_s2 = self.model.entity_emb.weight.register_hook(
+            self._make_selective_grad_hook(update_mask)
+        )
+
         for _ in range(steps):
             optimizer.zero_grad()
             curr_z = self.model.entity_emb.weight
 
-            # 1. Absolute priority: ensure new fact embeddings are learned
+            # 1. New fact supervision: ensure new fact representations are learned
             mu_pred_new, _ = self.model.predict(curr_z[h_idx], r_idx, curr_z[t_idx])
             loss_new = torch.mean((new_mu.detach() - mu_pred_new) ** 2)
 
-            # 2. Reasonable evolution: push affected old facts toward Bayesian-updated c_new
+            # 2. Affected old fact supervision: push toward Bayesian-updated c_new
             if affected_mask.any():
                 affected_edges = base_edge_idx[:, affected_mask]
                 affected_rels = base_edge_type[affected_mask]
@@ -451,11 +453,15 @@ class UnifiedConfidenceUpdater:
             else:
                 loss_affected = torch.tensor(0.0, device=self.device)
 
-            # 3. Elastic anchor: functional anchoring preserves prediction behaviour on
-            # affected edges; a weak absolute L2 prevents unbounded embedding drift.
-            weak_l2 = lambda_reg * (1.0 - func_anchor_ratio) * torch.mean(
-                (curr_z[:self.dataset.base_num_ent] - old_z[:self.dataset.base_num_ent].detach()) ** 2
-            )
+            # 3. Regularise affected old entity representations: don't deviate from original
+            if old_ents_for_reg.numel() > 0:
+                loss_reg_old = lambda_reg * torch.mean(
+                    (curr_z[old_ents_for_reg] - old_z[old_ents_for_reg].detach()) ** 2
+                )
+            else:
+                loss_reg_old = torch.tensor(0.0, device=self.device)
+
+            # 4. Functional anchor on affected edges: preserve prediction behaviour
             if affected_mask.any() and mu_old_affected is not None:
                 affected_edges_cur = base_edge_idx[:, affected_mask]
                 affected_rels_cur = base_edge_type[affected_mask]
@@ -463,13 +469,15 @@ class UnifiedConfidenceUpdater:
                     curr_z[affected_edges_cur[0]], affected_rels_cur, curr_z[affected_edges_cur[1]]
                 )
                 func_loss = F.mse_loss(mu_cur_affected, mu_old_affected)
-                loss_reg = lambda_reg * func_anchor_ratio * func_loss + weak_l2
+                loss_reg = lambda_reg * func_anchor_ratio * func_loss + loss_reg_old
             else:
-                loss_reg = weak_l2
+                loss_reg = loss_reg_old
 
             loss_total = loss_new + alpha * loss_affected + loss_reg
             loss_total.backward()
             optimizer.step()
+
+        hook_s2.remove()
 
         return real_affected_count
 
