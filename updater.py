@@ -48,14 +48,6 @@ class UnifiedConfidenceUpdater:
         raw_new_mu, new_sigma_sq = self._propagate_then_finetune(h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf)
         new_mu = self._relation_aware_calibration(raw_new_mu, new_sigma_sq, r_idx, base_edge_type, base_edge_conf)
 
-        # Recompute mu_without on the post-finetune model so causal influence assessment
-        # compares "base-graph-after-finetune" vs "combined-graph-after-finetune", preventing
-        # cumulative error amplification from stale pre-finetune predictions.
-        self.model.eval()
-        with torch.no_grad():
-            z_post = self.model(base_edge_idx, base_edge_type, base_edge_conf)
-            mu_without, _ = self.model.predict(z_post[base_edge_idx[0]], base_edge_type, z_post[base_edge_idx[1]])
-
         # 2. Causal influence assessment
         S_tau, mu_with, sigma_sq_old = self._compute_causal_influence(base_edge_idx, base_edge_type, base_edge_conf, mu_without, h_idx, r_idx, t_idx, new_mu, new_sigma_sq)
 
@@ -162,84 +154,51 @@ class UnifiedConfidenceUpdater:
         
         return calibrated
 
-    def _label_propagation(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf, hops=2):
-        """Deterministic label propagation from base GT to new facts. No model involved.
-
-        For each new fact (h, r, t):
-          1-hop : base edges where h or t appears as head or tail; same-relation edges
-                  get weight 2.0, different-relation edges get weight 1.0.
-          2-hop : if no 1-hop base neighbors exist, look through intermediate entities
-                  reachable from h/t via the current new-facts batch; half-weight (0.5×).
-          fallback: global relation-prior mean; then overall graph mean.
+    def _label_propagation(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf, tau=0.1):
         """
-        # Precompute relation-prior and global-mean from base GT (no model access)
-        r_prior = {}
-        for r_val in base_edge_type.unique().tolist():
-            mask = (base_edge_type == r_val)
-            r_prior[r_val] = base_edge_conf[mask].mean().item()
-        global_mean = base_edge_conf.mean().item() if base_edge_conf.numel() > 0 else 0.5
+        全张量化、基于关系感知的注意力标签传播 (无任何 for 循环)
+        """
+        # 1. 拓扑寻址：构建新事实与旧图谱边的连接矩阵 [N, E]
+        # h_idx: [N, 1], base_edge_idx[0/1]: [1, E] -> 广播比较生成 mask
+        h_match = (h_idx.unsqueeze(1) == base_edge_idx[0].unsqueeze(0)) | \
+                  (h_idx.unsqueeze(1) == base_edge_idx[1].unsqueeze(0))
+        t_match = (t_idx.unsqueeze(1) == base_edge_idx[0].unsqueeze(0)) | \
+                  (t_idx.unsqueeze(1) == base_edge_idx[1].unsqueeze(0))
+        
+        # connected_mask[i, j] = True 表示第 i 个新事实与第 j 条旧边相连 (1-hop 邻居)
+        connected_mask = h_match | t_match  # Shape: [N, E]
 
-        propagated = []
+        # 2. 语义注意力：计算关系特征的相似度
+        # 提取并 L2 归一化关系 Embedding
+        r_new_norm = F.normalize(self.model.relation_emb(r_idx), p=2, dim=-1)       # [N, D]
+        r_base_norm = F.normalize(self.model.relation_emb(base_edge_type), p=2, dim=-1) # [E, D]
 
-        for i in range(h_idx.shape[0]):
-            h = h_idx[i].item()
-            r = r_idx[i].item()
-            t = t_idx[i].item()
+        # 通过高效的矩阵乘法直接得到所有新旧关系对的余弦相似度矩阵 [N, E]
+        sim_matrix = torch.mm(r_new_norm, r_base_norm.t())
 
-            # --- 1-hop: base edges involving h or t ---
-            h_mask = (base_edge_idx[0] == h) | (base_edge_idx[1] == h)
-            t_mask = (base_edge_idx[0] == t) | (base_edge_idx[1] == t)
+        # 引入温度系数 tau 缩放 logits，控制注意力的锐度
+        attn_logits = sim_matrix / tau
 
-            confs, wts = [], []
-            for mask in [h_mask, t_mask]:
-                if mask.any():
-                    nc = base_edge_conf[mask]
-                    nr = base_edge_type[mask]
-                    same = (nr == r).float()
-                    w = 1.0 + same  # same=1.0 for matching relation → w=2.0; same=0.0 otherwise → w=1.0
-                    confs.append(nc)
-                    wts.append(w)
+        # 3. 掩码与归一化：屏蔽无拓扑连接的边，应用 Softmax
+        # 将不相连的边的 logit 设为负无穷，这样经过 softmax 后权重就严格为 0
+        attn_logits = attn_logits.masked_fill(~connected_mask, float('-inf'))
+        
+        # 按行 (每个新事实) 计算注意力权重
+        attn_weights = F.softmax(attn_logits, dim=1)  # Shape: [N, E]
+        
+        # 对于没有任何邻居的孤立节点，softmax 会因为全是 -inf 产生 NaN，将其替换为 0
+        attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
 
-            if confs:
-                all_c = torch.cat(confs)
-                all_w = torch.cat(wts)
-                propagated.append((all_c * all_w).sum() / all_w.sum())
-                continue
+        # 4. 信息聚合：用注意力权重对旧边置信度进行加权求和
+        # [N, E] * [1, E] -> 按行求和 -> [N]
+        propagated_conf = torch.sum(attn_weights * base_edge_conf.unsqueeze(0), dim=1)
 
-            # --- 2-hop fallback: intermediate entities from the new-fact batch ---
-            if hops >= 2:
-                inter_ents = set()
-                h_new = (h_idx == h) | (t_idx == h)
-                t_new = (h_idx == t) | (t_idx == t)
-                for nm in [h_new, t_new]:
-                    if nm.any():
-                        inter_ents.update(h_idx[nm].tolist())
-                        inter_ents.update(t_idx[nm].tolist())
-                inter_ents.discard(h)
-                inter_ents.discard(t)
+        # 5. 孤立节点 Fallback 机制：退化为全局平均置信度
+        has_neighbors = connected_mask.any(dim=1)
+        global_mean = base_edge_conf.mean() if base_edge_conf.numel() > 0 else torch.tensor(0.5, device=self.device)
+        propagated_conf = torch.where(has_neighbors, propagated_conf, global_mean)
 
-                hop2_c, hop2_w = [], []
-                for e in inter_ents:
-                    e_mask = (base_edge_idx[0] == e) | (base_edge_idx[1] == e)
-                    if e_mask.any():
-                        ec = base_edge_conf[e_mask]
-                        er = base_edge_type[e_mask]
-                        same = (er == r).float()
-                        w = 0.5 * (1.0 + same)  # 2-hop half-weight: 0.5 for different relation, 1.0 for same relation
-                        hop2_c.append(ec)
-                        hop2_w.append(w)
-
-                if hop2_c:
-                    all_c = torch.cat(hop2_c)
-                    all_w = torch.cat(hop2_w)
-                    propagated.append((all_c * all_w).sum() / all_w.sum())
-                    continue
-
-            # --- Ultimate fallback: relation prior, then global mean ---
-            prior_val = r_prior.get(r, global_mean)
-            propagated.append(torch.tensor(prior_val, dtype=torch.float, device=self.device))
-
-        return torch.stack(propagated)
+        return propagated_conf
 
     def _propagate_then_finetune(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf):
         """Two-phase approach: deterministic label propagation then base-GT-only fine-tuning.
@@ -255,24 +214,29 @@ class UnifiedConfidenceUpdater:
         Returns (new_mu, new_sigma) predicted after fine-tuning.
         """
         propagation_hops = getattr(self.args, 'propagation_hops', 2) if self.args else 2
-        finetune_steps = getattr(self.args, 'finetune_steps', 3) if self.args else 3
-        lambda_reg = self.args.lambda_reg if self.args else 0.1
+        finetune_steps = getattr(self.args, 'finetune_steps', 5) if self.args else 5
+        lambda_reg = self.args.lambda_reg if self.args else 0.001
+        lambda_reg = min(lambda_reg, 0.01)
         alpha_base = getattr(self.args, 'alpha_base', 1.0) if self.args else 1.0
         mlp_anchor_coeff = getattr(self.args, 'mlp_anchor_coeff', 0.01) if self.args else 0.01
         dynamic_update_interval = getattr(self.args, 'dynamic_update_interval', 2) if self.args else 2
         func_anchor_ratio = getattr(self.args, 'func_anchor_ratio', 0.9) if self.args else 0.9
         alpha_new = getattr(self.args, 'alpha_new_supervision', 0.3) if self.args else 0.3
-        alpha_link_pred = getattr(self.args, 'alpha_link_pred', 0.5) if self.args else 0.5
         base_num_ent = self.dataset.base_num_ent
 
         # ------------------------------------------------------------------
         # Phase 1: Deterministic label propagation (no model, no gradients)
         # ------------------------------------------------------------------
+        # with torch.no_grad():
+        #     propagated_conf = self._label_propagation(
+        #         h_idx, r_idx, t_idx,
+        #         base_edge_idx, base_edge_type, base_edge_conf,
+        #         hops=propagation_hops,
+        #     )
         with torch.no_grad():
             propagated_conf = self._label_propagation(
-                h_idx, r_idx, t_idx,
-                base_edge_idx, base_edge_type, base_edge_conf,
-                hops=propagation_hops,
+                h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf
+                # 如果你想调节注意力的锐度，可以加上 tau 参数，例如：tau=0.1
             )
 
         # Build combined graph using propagated_conf as input confidence for new edges
@@ -365,25 +329,8 @@ class UnifiedConfidenceUpdater:
                     loss_mlp_anchor = loss_mlp_anchor + torch.mean((param - old_mlp_params[name]) ** 2)
             loss_mlp_anchor = mlp_anchor_coeff * loss_mlp_anchor
 
-            if self.ablation_mode != "wo_link_pred":
-                loss_link_pred = self._negative_sampling_loss(z, h_idx, r_idx, t_idx)
-            else:
-                loss_link_pred = torch.tensor(0.0, device=self.device)
-
-            loss_total = alpha_base * loss_base + loss_new + loss_reg + loss_mlp_anchor + alpha_link_pred * loss_link_pred
+            loss_total = alpha_base * loss_base + loss_new + loss_reg + loss_mlp_anchor
             loss_total.backward()
-
-            # Zero out gradients for entities not involved in new facts or their
-            # 1-hop base-graph neighbours so unrelated embeddings are not updated.
-            if self.model.entity_emb.weight.grad is not None:
-                num_ent = self.model.entity_emb.weight.shape[0]
-                new_ents_set = torch.cat([h_idx, t_idx]).unique()
-                nb_mask = torch.isin(base_edge_idx[0], new_ents_set) | torch.isin(base_edge_idx[1], new_ents_set)
-                neighbors = torch.cat([base_edge_idx[0][nb_mask], base_edge_idx[1][nb_mask]]).unique()
-                involved_tensor = torch.cat([new_ents_set, neighbors]).unique()
-                grad_mask = torch.zeros(num_ent, dtype=torch.bool, device=self.device)
-                grad_mask[involved_tensor] = True
-                self.model.entity_emb.weight.grad[~grad_mask] = 0.0
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
@@ -458,7 +405,9 @@ class UnifiedConfidenceUpdater:
     def _local_representation_refinement(self, base_edge_idx, base_edge_type, c_new, old_z, S_tau, h_idx, r_idx, t_idx, new_mu):
         """Elastic rebalancing: fit new knowledge + evolve affected old knowledge + elastic anchor"""
         threshold = self.args.influence_threshold if self.args else 0.01
-        lambda_reg = self.args.lambda_reg if self.args else 0.1
+        lambda_reg = self.args.lambda_reg if self.args else 0.001
+        # Cap lambda_reg to prevent over-restriction in refinement stage
+        lambda_reg = min(lambda_reg, 0.01)
         func_anchor_ratio = getattr(self.args, 'func_anchor_ratio', 0.9) if self.args else 0.9
         alpha = 1.0
         steps = self.args.refine_steps if self.args else 3
@@ -470,25 +419,13 @@ class UnifiedConfidenceUpdater:
 
         real_affected_count = affected_mask.sum().item()
 
-        # Build combined graph (base + new edges) so predict() receives GNN-aggregated
-        # features that match the distribution seen during base model training.
-        _, _, base_edge_conf_stored = self.dataset.get_base_graph_data()
-        base_edge_conf_stored = base_edge_conf_stored.to(self.device)
-        combined_edge_index = torch.cat([base_edge_idx, torch.stack([h_idx, t_idx], dim=0)], dim=1)
-        combined_edge_type = torch.cat([base_edge_type, r_idx], dim=0)
-        combined_edge_conf = torch.cat([base_edge_conf_stored, new_mu.detach()], dim=0)
-
-        # Snapshot functional anchor: predictions on affected base edges using GNN-aggregated
-        # features from the current (post-finetune) model state — fixes distribution mismatch
-        # that occurred when raw entity embeddings were fed directly into predict().
+        # Snapshot functional anchor: old predictions on affected base edges using old embeddings
         with torch.no_grad():
-            self.model.eval()
             if affected_mask.any():
-                z_anchor = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
                 affected_edges_old = base_edge_idx[:, affected_mask]
                 affected_rels_old = base_edge_type[affected_mask]
                 mu_old_affected, _ = self.model.predict(
-                    z_anchor[affected_edges_old[0]], affected_rels_old, z_anchor[affected_edges_old[1]]
+                    old_z[affected_edges_old[0]], affected_rels_old, old_z[affected_edges_old[1]]
                 )
                 mu_old_affected = mu_old_affected.detach()
             else:
@@ -499,32 +436,33 @@ class UnifiedConfidenceUpdater:
 
         for _ in range(steps):
             optimizer.zero_grad()
-
-            # Run full GNN forward pass so predict() receives proper aggregated features
-            z = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
+            curr_z = self.model.entity_emb.weight
 
             # 1. Absolute priority: ensure new fact embeddings are learned
-            mu_pred_new, _ = self.model.predict(z[h_idx], r_idx, z[t_idx])
+            mu_pred_new, _ = self.model.predict(curr_z[h_idx], r_idx, curr_z[t_idx])
             loss_new = torch.mean((new_mu.detach() - mu_pred_new) ** 2)
 
             # 2. Reasonable evolution: push affected old facts toward Bayesian-updated c_new
             if affected_mask.any():
                 affected_edges = base_edge_idx[:, affected_mask]
                 affected_rels = base_edge_type[affected_mask]
-                mu_pred_old, _ = self.model.predict(z[affected_edges[0]], affected_rels, z[affected_edges[1]])
+                mu_pred_old, _ = self.model.predict(curr_z[affected_edges[0]], affected_rels, curr_z[affected_edges[1]])
                 loss_affected = torch.mean((c_new[affected_mask] - mu_pred_old) ** 2)
             else:
                 loss_affected = torch.tensor(0.0, device=self.device)
 
             # 3. Elastic anchor: functional anchoring preserves prediction behaviour on
             # affected edges; a weak absolute L2 prevents unbounded embedding drift.
-            # Weak L2 anchors raw embeddings (entity_emb.weight) to pre-refinement snapshot.
-            curr_emb = self.model.entity_emb.weight
             weak_l2 = lambda_reg * (1.0 - func_anchor_ratio) * torch.mean(
-                (curr_emb[:self.dataset.base_num_ent] - old_z[:self.dataset.base_num_ent].detach()) ** 2
+                (curr_z[:self.dataset.base_num_ent] - old_z[:self.dataset.base_num_ent].detach()) ** 2
             )
             if affected_mask.any() and mu_old_affected is not None:
-                func_loss = F.mse_loss(mu_pred_old, mu_old_affected)
+                affected_edges_cur = base_edge_idx[:, affected_mask]
+                affected_rels_cur = base_edge_type[affected_mask]
+                mu_cur_affected, _ = self.model.predict(
+                    curr_z[affected_edges_cur[0]], affected_rels_cur, curr_z[affected_edges_cur[1]]
+                )
+                func_loss = F.mse_loss(mu_cur_affected, mu_old_affected)
                 loss_reg = lambda_reg * func_anchor_ratio * func_loss + weak_l2
             else:
                 loss_reg = weak_l2
@@ -534,59 +472,6 @@ class UnifiedConfidenceUpdater:
             optimizer.step()
 
         return real_affected_count
-
-    def _negative_sampling_loss(self, z, h_idx, r_idx, t_idx):
-        """Margin-based ranking loss using link prediction self-supervision.
-
-        For each new fact (h, r, t):
-          - Positive: s_pos = model.predict(z[h], r, z[t])
-          - Tail-replaced negatives: (h, r, t') with t' sampled from [0, num_ent)
-          - Head-replaced negatives: (h', r, t) with h' sampled from [0, num_ent)
-          - Loss: mean( max(0, margin - s_pos + s_neg) )
-
-        Negatives are sampled from the full entity pool [0, num_ent) including new
-        entities, so the model learns to discriminate real facts from random
-        combinations across the entire entity space.
-        """
-        num_ent = self.dataset.num_ent
-        num_neg = getattr(self.args, 'num_neg_samples', 5) if self.args else 5
-        margin = getattr(self.args, 'link_pred_margin', 0.3) if self.args else 0.3
-
-        batch_size = h_idx.size(0)
-
-        # Positive scores — shape (B,)
-        s_pos, _ = self.model.predict(z[h_idx], r_idx, z[t_idx])
-
-        with torch.no_grad():
-            # Collision-free sampling: sample from [0, num_ent-1) then shift values
-            # that are >= the true entity index, guaranteeing no collision without
-            # introducing modulo wrap-around issues.
-
-            # Tail-entity replacement — (B, num_neg)
-            t_neg = torch.randint(0, num_ent - 1, (batch_size, num_neg), device=self.device)
-            t_neg[t_neg >= t_idx.unsqueeze(1)] += 1
-
-            # Head-entity replacement — (B, num_neg)
-            h_neg = torch.randint(0, num_ent - 1, (batch_size, num_neg), device=self.device)
-            h_neg[h_neg >= h_idx.unsqueeze(1)] += 1
-
-        # Expand positive inputs for batched negative scoring — (B * num_neg,)
-        h_exp = h_idx.unsqueeze(1).expand(batch_size, num_neg).reshape(-1)
-        t_exp = t_idx.unsqueeze(1).expand(batch_size, num_neg).reshape(-1)
-        r_exp = r_idx.unsqueeze(1).expand(batch_size, num_neg).reshape(-1)
-        s_pos_exp = s_pos.unsqueeze(1).expand(batch_size, num_neg).reshape(-1)
-
-        # Tail-replacement negatives — one batched predict call
-        t_neg_flat = t_neg.reshape(-1)
-        s_neg_tail, _ = self.model.predict(z[h_exp], r_exp, z[t_neg_flat])
-        loss_tail = torch.clamp(margin - s_pos_exp + s_neg_tail, min=0.0)
-
-        # Head-replacement negatives — one batched predict call
-        h_neg_flat = h_neg.reshape(-1)
-        s_neg_head, _ = self.model.predict(z[h_neg_flat], r_exp, z[t_exp])
-        loss_head = torch.clamp(margin - s_pos_exp + s_neg_head, min=0.0)
-
-        return torch.cat([loss_tail, loss_head]).mean()
 
     def _update_dataset_belief(self, base_edge_idx, base_edge_type, updated_beliefs):
         h_list = base_edge_idx[0].cpu().numpy()
