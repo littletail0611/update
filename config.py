@@ -43,6 +43,9 @@ def get_args(argv=None):
     parser.add_argument("--func_anchor_ratio", type=float, default=0.9, help="Blend ratio for functional anchoring: func_anchor_ratio * functional_loss + (1 - func_anchor_ratio) * weak_absolute_L2")
     parser.add_argument("--alpha_new_supervision", type=float, default=0.3,
                         help="Weight for new-fact pseudo-label supervision in fine-tuning")
+    parser.add_argument("--num_neg_samples", type=int, default=5, help="Number of negative samples per positive for link prediction self-supervision")
+    parser.add_argument("--link_pred_margin", type=float, default=0.3, help="Margin for link prediction ranking loss")
+    parser.add_argument("--alpha_link_pred", type=float, default=0.5, help="Weight for link prediction self-supervision loss")
 
     # ================= 6. 调参模式 =================
     parser.add_argument("--tuning_mode", action="store_true", default=False, help="Enable tuning mode: suppresses verbose console output during hyperparameter search")

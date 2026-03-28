@@ -203,6 +203,9 @@ STAGE_FINETUNE_GRID = {
     "mlp_anchor_coeff": [0.001, 0.01, 0.1],
     "finetune_steps": [3, 5, 10],
     "propagation_hops": [1, 2, 3],
+    "alpha_link_pred": [0.1, 0.3, 0.5, 1.0],
+    "num_neg_samples": [3, 5, 10],
+    "link_pred_margin": [0.1, 0.3, 0.5],
 }
 
 
@@ -232,6 +235,9 @@ def _suggest_finetune_params(trial):
         "mlp_anchor_coeff": trial.suggest_float("mlp_anchor_coeff", 0.001, 0.1, log=True),
         "finetune_steps": trial.suggest_categorical("finetune_steps", [2, 3, 5, 8, 10, 15]),
         "propagation_hops": trial.suggest_categorical("propagation_hops", [1, 2, 3]),
+        "alpha_link_pred": trial.suggest_float("alpha_link_pred", 0.05, 1.5, log=True),
+        "num_neg_samples": trial.suggest_categorical("num_neg_samples", [3, 5, 10]),
+        "link_pred_margin": trial.suggest_float("link_pred_margin", 0.05, 0.8),
     }
 
 

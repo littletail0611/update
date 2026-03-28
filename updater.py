@@ -255,6 +255,7 @@ class UnifiedConfidenceUpdater:
         dynamic_update_interval = getattr(self.args, 'dynamic_update_interval', 2) if self.args else 2
         func_anchor_ratio = getattr(self.args, 'func_anchor_ratio', 0.9) if self.args else 0.9
         alpha_new = getattr(self.args, 'alpha_new_supervision', 0.3) if self.args else 0.3
+        alpha_link_pred = getattr(self.args, 'alpha_link_pred', 0.5) if self.args else 0.5
         base_num_ent = self.dataset.base_num_ent
 
         # ------------------------------------------------------------------
@@ -357,7 +358,12 @@ class UnifiedConfidenceUpdater:
                     loss_mlp_anchor = loss_mlp_anchor + torch.mean((param - old_mlp_params[name]) ** 2)
             loss_mlp_anchor = mlp_anchor_coeff * loss_mlp_anchor
 
-            loss_total = alpha_base * loss_base + loss_new + loss_reg + loss_mlp_anchor
+            if self.ablation_mode != "wo_link_pred":
+                loss_link_pred = self._negative_sampling_loss(z, h_idx, r_idx, t_idx)
+            else:
+                loss_link_pred = torch.tensor(0.0, device=self.device)
+
+            loss_total = alpha_base * loss_base + loss_new + loss_reg + loss_mlp_anchor + alpha_link_pred * loss_link_pred
             loss_total.backward()
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
@@ -500,6 +506,59 @@ class UnifiedConfidenceUpdater:
             optimizer.step()
 
         return real_affected_count
+
+    def _negative_sampling_loss(self, z, h_idx, r_idx, t_idx):
+        """Margin-based ranking loss using link prediction self-supervision.
+
+        For each new fact (h, r, t):
+          - Positive: s_pos = model.predict(z[h], r, z[t])
+          - Tail-replaced negatives: (h, r, t') with t' sampled from [0, num_ent)
+          - Head-replaced negatives: (h', r, t) with h' sampled from [0, num_ent)
+          - Loss: mean( max(0, margin - s_pos + s_neg) )
+
+        Negatives are sampled from the full entity pool [0, num_ent) including new
+        entities, so the model learns to discriminate real facts from random
+        combinations across the entire entity space.
+        """
+        num_ent = self.dataset.num_ent
+        num_neg = getattr(self.args, 'num_neg_samples', 5) if self.args else 5
+        margin = getattr(self.args, 'link_pred_margin', 0.3) if self.args else 0.3
+
+        batch_size = h_idx.size(0)
+
+        # Positive scores — shape (B,)
+        s_pos, _ = self.model.predict(z[h_idx], r_idx, z[t_idx])
+
+        with torch.no_grad():
+            # Collision-free sampling: sample from [0, num_ent-1) then shift values
+            # that are >= the true entity index, guaranteeing no collision without
+            # introducing modulo wrap-around issues.
+
+            # Tail-entity replacement — (B, num_neg)
+            t_neg = torch.randint(0, num_ent - 1, (batch_size, num_neg), device=self.device)
+            t_neg[t_neg >= t_idx.unsqueeze(1)] += 1
+
+            # Head-entity replacement — (B, num_neg)
+            h_neg = torch.randint(0, num_ent - 1, (batch_size, num_neg), device=self.device)
+            h_neg[h_neg >= h_idx.unsqueeze(1)] += 1
+
+        # Expand positive inputs for batched negative scoring — (B * num_neg,)
+        h_exp = h_idx.unsqueeze(1).expand(batch_size, num_neg).reshape(-1)
+        t_exp = t_idx.unsqueeze(1).expand(batch_size, num_neg).reshape(-1)
+        r_exp = r_idx.unsqueeze(1).expand(batch_size, num_neg).reshape(-1)
+        s_pos_exp = s_pos.unsqueeze(1).expand(batch_size, num_neg).reshape(-1)
+
+        # Tail-replacement negatives — one batched predict call
+        t_neg_flat = t_neg.reshape(-1)
+        s_neg_tail, _ = self.model.predict(z[h_exp], r_exp, z[t_neg_flat])
+        loss_tail = torch.clamp(margin - s_pos_exp + s_neg_tail, min=0.0)
+
+        # Head-replacement negatives — one batched predict call
+        h_neg_flat = h_neg.reshape(-1)
+        s_neg_head, _ = self.model.predict(z[h_neg_flat], r_exp, z[t_exp])
+        loss_head = torch.clamp(margin - s_pos_exp + s_neg_head, min=0.0)
+
+        return torch.cat([loss_tail, loss_head]).mean()
 
     def _update_dataset_belief(self, base_edge_idx, base_edge_type, updated_beliefs):
         h_list = base_edge_idx[0].cpu().numpy()
