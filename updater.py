@@ -48,6 +48,14 @@ class UnifiedConfidenceUpdater:
         raw_new_mu, new_sigma_sq = self._propagate_then_finetune(h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf)
         new_mu = self._relation_aware_calibration(raw_new_mu, new_sigma_sq, r_idx, base_edge_type, base_edge_conf)
 
+        # Recompute mu_without on the post-finetune model so causal influence assessment
+        # compares "base-graph-after-finetune" vs "combined-graph-after-finetune", preventing
+        # cumulative error amplification from stale pre-finetune predictions.
+        self.model.eval()
+        with torch.no_grad():
+            z_post = self.model(base_edge_idx, base_edge_type, base_edge_conf)
+            mu_without, _ = self.model.predict(z_post[base_edge_idx[0]], base_edge_type, z_post[base_edge_idx[1]])
+
         # 2. Causal influence assessment
         S_tau, mu_with, sigma_sq_old = self._compute_causal_influence(base_edge_idx, base_edge_type, base_edge_conf, mu_without, h_idx, r_idx, t_idx, new_mu, new_sigma_sq)
 
@@ -247,9 +255,8 @@ class UnifiedConfidenceUpdater:
         Returns (new_mu, new_sigma) predicted after fine-tuning.
         """
         propagation_hops = getattr(self.args, 'propagation_hops', 2) if self.args else 2
-        finetune_steps = getattr(self.args, 'finetune_steps', 5) if self.args else 5
-        lambda_reg = self.args.lambda_reg if self.args else 0.001
-        lambda_reg = min(lambda_reg, 0.01)
+        finetune_steps = getattr(self.args, 'finetune_steps', 3) if self.args else 3
+        lambda_reg = self.args.lambda_reg if self.args else 0.1
         alpha_base = getattr(self.args, 'alpha_base', 1.0) if self.args else 1.0
         mlp_anchor_coeff = getattr(self.args, 'mlp_anchor_coeff', 0.01) if self.args else 0.01
         dynamic_update_interval = getattr(self.args, 'dynamic_update_interval', 2) if self.args else 2
@@ -366,6 +373,18 @@ class UnifiedConfidenceUpdater:
             loss_total = alpha_base * loss_base + loss_new + loss_reg + loss_mlp_anchor + alpha_link_pred * loss_link_pred
             loss_total.backward()
 
+            # Zero out gradients for entities not involved in new facts or their
+            # 1-hop base-graph neighbours so unrelated embeddings are not updated.
+            if self.model.entity_emb.weight.grad is not None:
+                num_ent = self.model.entity_emb.weight.shape[0]
+                new_ents_set = torch.cat([h_idx, t_idx]).unique()
+                nb_mask = torch.isin(base_edge_idx[0], new_ents_set) | torch.isin(base_edge_idx[1], new_ents_set)
+                neighbors = torch.cat([base_edge_idx[0][nb_mask], base_edge_idx[1][nb_mask]]).unique()
+                involved_tensor = torch.cat([new_ents_set, neighbors]).unique()
+                grad_mask = torch.zeros(num_ent, dtype=torch.bool, device=self.device)
+                grad_mask[involved_tensor] = True
+                self.model.entity_emb.weight.grad[~grad_mask] = 0.0
+
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
 
@@ -439,9 +458,7 @@ class UnifiedConfidenceUpdater:
     def _local_representation_refinement(self, base_edge_idx, base_edge_type, c_new, old_z, S_tau, h_idx, r_idx, t_idx, new_mu):
         """Elastic rebalancing: fit new knowledge + evolve affected old knowledge + elastic anchor"""
         threshold = self.args.influence_threshold if self.args else 0.01
-        lambda_reg = self.args.lambda_reg if self.args else 0.001
-        # Cap lambda_reg to prevent over-restriction in refinement stage
-        lambda_reg = min(lambda_reg, 0.01)
+        lambda_reg = self.args.lambda_reg if self.args else 0.1
         func_anchor_ratio = getattr(self.args, 'func_anchor_ratio', 0.9) if self.args else 0.9
         alpha = 1.0
         steps = self.args.refine_steps if self.args else 3
@@ -453,13 +470,25 @@ class UnifiedConfidenceUpdater:
 
         real_affected_count = affected_mask.sum().item()
 
-        # Snapshot functional anchor: old predictions on affected base edges using old embeddings
+        # Build combined graph (base + new edges) so predict() receives GNN-aggregated
+        # features that match the distribution seen during base model training.
+        _, _, base_edge_conf_stored = self.dataset.get_base_graph_data()
+        base_edge_conf_stored = base_edge_conf_stored.to(self.device)
+        combined_edge_index = torch.cat([base_edge_idx, torch.stack([h_idx, t_idx], dim=0)], dim=1)
+        combined_edge_type = torch.cat([base_edge_type, r_idx], dim=0)
+        combined_edge_conf = torch.cat([base_edge_conf_stored, new_mu.detach()], dim=0)
+
+        # Snapshot functional anchor: predictions on affected base edges using GNN-aggregated
+        # features from the current (post-finetune) model state — fixes distribution mismatch
+        # that occurred when raw entity embeddings were fed directly into predict().
         with torch.no_grad():
+            self.model.eval()
             if affected_mask.any():
+                z_anchor = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
                 affected_edges_old = base_edge_idx[:, affected_mask]
                 affected_rels_old = base_edge_type[affected_mask]
                 mu_old_affected, _ = self.model.predict(
-                    old_z[affected_edges_old[0]], affected_rels_old, old_z[affected_edges_old[1]]
+                    z_anchor[affected_edges_old[0]], affected_rels_old, z_anchor[affected_edges_old[1]]
                 )
                 mu_old_affected = mu_old_affected.detach()
             else:
@@ -470,33 +499,32 @@ class UnifiedConfidenceUpdater:
 
         for _ in range(steps):
             optimizer.zero_grad()
-            curr_z = self.model.entity_emb.weight
+
+            # Run full GNN forward pass so predict() receives proper aggregated features
+            z = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
 
             # 1. Absolute priority: ensure new fact embeddings are learned
-            mu_pred_new, _ = self.model.predict(curr_z[h_idx], r_idx, curr_z[t_idx])
+            mu_pred_new, _ = self.model.predict(z[h_idx], r_idx, z[t_idx])
             loss_new = torch.mean((new_mu.detach() - mu_pred_new) ** 2)
 
             # 2. Reasonable evolution: push affected old facts toward Bayesian-updated c_new
             if affected_mask.any():
                 affected_edges = base_edge_idx[:, affected_mask]
                 affected_rels = base_edge_type[affected_mask]
-                mu_pred_old, _ = self.model.predict(curr_z[affected_edges[0]], affected_rels, curr_z[affected_edges[1]])
+                mu_pred_old, _ = self.model.predict(z[affected_edges[0]], affected_rels, z[affected_edges[1]])
                 loss_affected = torch.mean((c_new[affected_mask] - mu_pred_old) ** 2)
             else:
                 loss_affected = torch.tensor(0.0, device=self.device)
 
             # 3. Elastic anchor: functional anchoring preserves prediction behaviour on
             # affected edges; a weak absolute L2 prevents unbounded embedding drift.
+            # Weak L2 anchors raw embeddings (entity_emb.weight) to pre-refinement snapshot.
+            curr_emb = self.model.entity_emb.weight
             weak_l2 = lambda_reg * (1.0 - func_anchor_ratio) * torch.mean(
-                (curr_z[:self.dataset.base_num_ent] - old_z[:self.dataset.base_num_ent].detach()) ** 2
+                (curr_emb[:self.dataset.base_num_ent] - old_z[:self.dataset.base_num_ent].detach()) ** 2
             )
             if affected_mask.any() and mu_old_affected is not None:
-                affected_edges_cur = base_edge_idx[:, affected_mask]
-                affected_rels_cur = base_edge_type[affected_mask]
-                mu_cur_affected, _ = self.model.predict(
-                    curr_z[affected_edges_cur[0]], affected_rels_cur, curr_z[affected_edges_cur[1]]
-                )
-                func_loss = F.mse_loss(mu_cur_affected, mu_old_affected)
+                func_loss = F.mse_loss(mu_pred_old, mu_old_affected)
                 loss_reg = lambda_reg * func_anchor_ratio * func_loss + weak_l2
             else:
                 loss_reg = weak_l2
