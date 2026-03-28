@@ -45,7 +45,8 @@ class UnifiedConfidenceUpdater:
             old_raw_emb = self.model.entity_emb.weight.detach().clone()
 
         # 1. Propagate-then-finetune stage (deterministic label propagation + base-GT-only fine-tuning)
-        new_mu, new_sigma_sq = self._propagate_then_finetune(h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf)
+        raw_new_mu, new_sigma_sq = self._propagate_then_finetune(h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf)
+        new_mu = self._relation_aware_calibration(raw_new_mu, new_sigma_sq, r_idx, base_edge_type, base_edge_conf)
 
         # 2. Causal influence assessment
         S_tau, mu_with, sigma_sq_old = self._compute_causal_influence(base_edge_idx, base_edge_type, base_edge_conf, mu_without, h_idx, r_idx, t_idx, new_mu, new_sigma_sq)
@@ -57,6 +58,15 @@ class UnifiedConfidenceUpdater:
         real_affected_count = self._local_representation_refinement(base_edge_idx, base_edge_type, c_new, old_raw_emb, S_tau, h_idx, r_idx, t_idx, new_mu)
 
         self._update_dataset_belief(base_edge_idx, base_edge_type, c_new)
+
+        # Write new-fact beliefs back to dataset
+        new_mu_np = new_mu.detach().cpu().numpy()
+        h_np = h_idx.cpu().numpy()
+        r_np = r_idx.cpu().numpy()
+        t_np = t_idx.cpu().numpy()
+        for i in range(len(h_np)):
+            fact_tuple = (int(h_np[i]), int(r_np[i]), int(t_np[i]))
+            self.dataset.belief_state[fact_tuple] = float(new_mu_np[i])
 
         change_tensor = torch.abs(c_new - c_old)
         return new_mu.detach(), change_tensor.mean().item(), change_tensor.max().item(), real_affected_count
@@ -105,6 +115,44 @@ class UnifiedConfidenceUpdater:
                     if neighbors:
                         neighbor_tensor = torch.tensor(neighbors, dtype=torch.long, device=self.device)
                         ent_weight[ent_id] = ent_weight[neighbor_tensor].mean(dim=0)
+
+    def _relation_aware_calibration(self, new_mu, new_sigma_sq, r_idx,
+                                     base_edge_type, base_edge_conf):
+        """Calibrate model predictions for new facts using relation-level priors.
+        
+        For each new fact (h, r, t):
+            calibrated_mu = w * new_mu + (1 - w) * prior_mu_r
+            where w = model_precision / (model_precision + prior_precision)
+        """
+        calibrated = torch.zeros_like(new_mu)
+        
+        # Precompute per-relation statistics from base graph
+        r_stats = {}
+        for r_val in base_edge_type.unique().tolist():
+            mask = (base_edge_type == r_val)
+            confs = base_edge_conf[mask]
+            r_stats[r_val] = {
+                'mean': confs.mean().item(),
+                'var': confs.var().item() if confs.numel() > 1 else 0.1,
+                'count': confs.numel()
+            }
+        
+        global_mean = base_edge_conf.mean().item() if base_edge_conf.numel() > 0 else 0.5
+        global_var = base_edge_conf.var().item() if base_edge_conf.numel() > 1 else 0.1
+        
+        for i in range(new_mu.shape[0]):
+            r = r_idx[i].item()
+            stats = r_stats.get(r, {'mean': global_mean, 'var': global_var, 'count': 1})
+            
+            prior_mu = stats['mean']
+            prior_precision = 1.0 / (stats['var'] + 1e-6)
+            model_precision = 1.0 / (new_sigma_sq[i].item() + 1e-6)
+            
+            # Bayesian precision weighting
+            w = model_precision / (model_precision + prior_precision)
+            calibrated[i] = w * new_mu[i] + (1 - w) * prior_mu
+        
+        return calibrated
 
     def _label_propagation(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf, hops=2):
         """Deterministic label propagation from base GT to new facts. No model involved.
@@ -204,9 +252,9 @@ class UnifiedConfidenceUpdater:
         lambda_reg = min(lambda_reg, 0.01)
         alpha_base = getattr(self.args, 'alpha_base', 1.0) if self.args else 1.0
         mlp_anchor_coeff = getattr(self.args, 'mlp_anchor_coeff', 0.01) if self.args else 0.01
-        soft_label_weight = getattr(self.args, 'soft_label_weight', 0.5) if self.args else 0.5
         dynamic_update_interval = getattr(self.args, 'dynamic_update_interval', 2) if self.args else 2
         func_anchor_ratio = getattr(self.args, 'func_anchor_ratio', 0.9) if self.args else 0.9
+        alpha_new = getattr(self.args, 'alpha_new_supervision', 0.3) if self.args else 0.3
         base_num_ent = self.dataset.base_num_ent
 
         # ------------------------------------------------------------------
@@ -264,19 +312,10 @@ class UnifiedConfidenceUpdater:
 
         self.model.train()
 
-        for step in range(finetune_steps):
+        for step_i in range(finetune_steps):
             optimizer.zero_grad()
 
             z = self.model(combined_edge_index, combined_edge_type, combined_edge_conf)
-
-            # Sigma-weighted soft supervision loss on new facts (HPL-inspired)
-            # Use propagated_conf as soft target; weight by exp(-sigma) so uncertain
-            # predictions receive less gradient from the pseudo-label.
-            mu_new_pred, sigma_new_pred = self.model.predict(z[h_idx], r_idx, z[t_idx])
-            # exp(-sigma) in (0, 1]; divide by 2 to keep max weight at 0.5 so
-            # soft-label loss is at most half the magnitude of a standard MSE term.
-            weight_new = torch.exp(-sigma_new_pred.detach()) / 2.0
-            loss_soft = torch.mean(weight_new * (mu_new_pred - propagated_conf.detach()) ** 2)
 
             # Sole supervision: base GT on shared-entity edges
             if replay_mask.any():
@@ -289,6 +328,11 @@ class UnifiedConfidenceUpdater:
                 loss_base = F.mse_loss(mu_base_pred, replay_conf_gt)
             else:
                 loss_base = torch.tensor(0.0, device=self.device)
+
+            # Direct new-fact supervision using propagated_conf as soft labels
+            mu_new_pred, _ = self.model.predict(z[h_idx], r_idx, z[t_idx])
+            ramp = min(1.0, (step_i + 1) / finetune_steps)
+            loss_new = alpha_new * ramp * F.mse_loss(mu_new_pred, propagated_conf.detach())
 
             # Embedding anchor regularisation (prevent catastrophic forgetting)
             # Functional anchoring: penalise changes in predictions on replay edges
@@ -313,7 +357,7 @@ class UnifiedConfidenceUpdater:
                     loss_mlp_anchor = loss_mlp_anchor + torch.mean((param - old_mlp_params[name]) ** 2)
             loss_mlp_anchor = mlp_anchor_coeff * loss_mlp_anchor
 
-            loss_total = alpha_base * loss_base + soft_label_weight * loss_soft + loss_reg + loss_mlp_anchor
+            loss_total = alpha_base * loss_base + loss_new + loss_reg + loss_mlp_anchor
             loss_total.backward()
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
@@ -322,7 +366,7 @@ class UnifiedConfidenceUpdater:
             # Dynamic pseudo-label update: refresh combined_edge_conf for new facts
             # every dynamic_update_interval steps so the soft target tracks the model.
             # Skip step 0 — the model hasn't been updated yet at that point.
-            if dynamic_update_interval > 0 and step > 0 and step % dynamic_update_interval == 0:
+            if dynamic_update_interval > 0 and step_i > 0 and step_i % dynamic_update_interval == 0:
                 with torch.no_grad():
                     combined_edge_conf = torch.cat(
                         [base_edge_conf, mu_new_pred.detach().clamp(0.0, 1.0)], dim=0
