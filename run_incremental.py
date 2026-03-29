@@ -11,7 +11,8 @@ from utils import evaluate_model, Logger
 from config import get_args
 
 def run_incremental_update(args):
-    print(f"=== 第二阶段: 启动流式增量 Belief 更新 (设备: {args.device}) ===")
+    mode_str = "Single-batch (one-shot)" if args.single_batch else "Streaming (mini-batch)"
+    print(f"=== 第二阶段: 启动增量 Belief 更新 [模式: {mode_str}] (设备: {args.device}) ===")
     
     # 动态提取数据集名称，匹配对应的权重路径
     dataset_name = os.path.basename(os.path.normpath(args.data_dir))
@@ -62,22 +63,32 @@ def run_incremental_update(args):
         args=args 
     )
     
-    # 4. 模拟流式处理新事实 Batch
-    print(f"\n>>> 开始处理 Inc 新事实 (Batch Size: {args.inc_batch_size})...")
-    inc_batches = list(dataset.get_incremental_batches(batch_size=args.inc_batch_size))
-    
-    for batch_idx, batch_facts in enumerate(inc_batches):
-        print(f"\n--- 处理 Batch {batch_idx + 1}/{len(inc_batches)} ---")
-        
-        # 执行核心更新逻辑，返回真实的变动幅度
-        # new_mu, actual_change = updater.step(batch_facts)
-        new_mu, actual_change_mean, actual_change_max, affected_count = updater.step(batch_facts)
-        
-        print(f"Batch {batch_idx + 1} 摘要:")
-        print(f"  - 推断新事实平均置信度: {new_mu.mean().item():.4f}")
-        print(f"  - 全局平均变动幅度: {actual_change_mean:.6f}")
-        print(f"  - 局部最大变动幅度: {actual_change_max:.4f}")
-        print(f"  - 达到阈值受影响的旧事实数: {affected_count} 条")
+    # 4. 处理新事实：单批次（默认）或流式小批次模式
+    if args.single_batch:
+        # One-shot: process all inc_train facts at once
+        all_facts = dataset.inc_train
+        print(f"\n>>> [Single-batch mode] Processing all {len(all_facts)} inc facts at once...")
+        new_mu, actual_change_mean, actual_change_max, affected_count = updater.step(all_facts)
+        print(f"Single-batch update summary:")
+        print(f"  - Predicted new fact avg confidence: {new_mu.mean().item():.4f}")
+        print(f"  - Global mean change: {actual_change_mean:.6f}")
+        print(f"  - Local max change: {actual_change_max:.4f}")
+        print(f"  - Affected old facts above threshold: {affected_count}")
+    else:
+        # Streaming mode: process in mini-batches (existing logic)
+        print(f"\n>>> 开始处理 Inc 新事实 (Batch Size: {args.inc_batch_size})...")
+        inc_batches = list(dataset.get_incremental_batches(batch_size=args.inc_batch_size))
+
+        for batch_idx, batch_facts in enumerate(inc_batches):
+            print(f"\n--- 处理 Batch {batch_idx + 1}/{len(inc_batches)} ---")
+
+            new_mu, actual_change_mean, actual_change_max, affected_count = updater.step(batch_facts)
+
+            print(f"Batch {batch_idx + 1} 摘要:")
+            print(f"  - 推断新事实平均置信度: {new_mu.mean().item():.4f}")
+            print(f"  - 全局平均变动幅度: {actual_change_mean:.6f}")
+            print(f"  - 局部最大变动幅度: {actual_change_max:.4f}")
+            print(f"  - 达到阈值受影响的旧事实数: {affected_count} 条")
         
     print("\n=== 所有增量更新任务执行完毕，执行最终全面评估 ===")
     
