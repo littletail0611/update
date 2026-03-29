@@ -24,6 +24,10 @@ def get_args(argv=None):
     
     # ================= 4. 增量更新 (Online Updating) 核心数学参数 =================
     parser.add_argument("--inc_batch_size", type=int, default=1024, help="流式处理新事实的 Batch 大小")
+    parser.add_argument("--single_batch", action="store_true", default=True,
+                        help="Process all incremental facts in a single batch (one-shot update). "
+                             "Set --no-single_batch for streaming/continual mode.")
+    parser.add_argument("--no-single_batch", dest="single_batch", action="store_false")
     parser.add_argument("--inc_lr", type=float, default=0.005, help="局部 EM 和微调时的学习率")
     parser.add_argument("--em_steps", type=int, default=15, help="局部 EM 推断的交替迭代次数")
     parser.add_argument("--gamma", type=float, default=0.8, help="因果影响多跳传播的衰减因子")

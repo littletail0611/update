@@ -187,8 +187,8 @@ class UnifiedConfidenceUpdater:
             return grad_clone
         return hook
 
-    def _few_shot_confidence_init(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf, top_k=10, tau=0.1):
-        """Few-shot inspired confidence initialization for new facts.
+    def _label_propagation_core(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf, top_k=10, tau=0.1):
+        """Few-shot inspired confidence initialization for new facts (core implementation).
 
         For each new fact (h, r, t), finds old facts with the SAME relation r that are
         semantically similar (measured by cosine similarity of the entity-pair embedding
@@ -234,6 +234,43 @@ class UnifiedConfidenceUpdater:
 
         return propagated_conf
 
+    def _label_propagation(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf, top_k=10, tau=0.1):
+        """Chunked wrapper around _label_propagation_core for large-batch robustness.
+
+        When the number of new facts N is large, processing all facts at once may
+        require substantial memory. This wrapper splits the input into manageable
+        chunks and concatenates the results, keeping peak memory bounded.
+
+        The chunk size is derived from a 200 MB budget relative to the number of
+        base edges E, matching the memory profile of an [N, E] similarity matrix
+        at float32 precision.
+        """
+        N = h_idx.shape[0]
+        E = base_edge_idx.shape[1]
+
+        # ~200 MB budget for float32: 200 * 1024^2 / 4 bytes = 52,428,800 ≈ 50,000,000 elements
+        max_matrix_elements = 50_000_000
+        chunk_size = max(1, max_matrix_elements // max(E, 1))
+
+        if N <= chunk_size:
+            return self._label_propagation_core(
+                h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf, top_k, tau
+            )
+
+        # Process in chunks and concatenate results
+        results = []
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            chunk_result = self._label_propagation_core(
+                h_idx[start:end], r_idx[start:end], t_idx[start:end],
+                base_edge_idx, base_edge_type, base_edge_conf, top_k, tau
+            )
+            results.append(chunk_result)
+        return torch.cat(results, dim=0)
+
+    # Backward-compatible alias kept for external callers
+    _few_shot_confidence_init = _label_propagation
+
     def _propagate_then_finetune(self, h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf,
                                   has_label_mask=None, known_conf=None):
         """Stage 1: Few-shot confidence init + new-entity-only fine-tuning.
@@ -274,7 +311,7 @@ class UnifiedConfidenceUpdater:
         # For labeled facts, override the propagated value with the known GT.
         # ------------------------------------------------------------------
         with torch.no_grad():
-            propagated_conf = self._few_shot_confidence_init(
+            propagated_conf = self._label_propagation(
                 h_idx, r_idx, t_idx, base_edge_idx, base_edge_type, base_edge_conf
             )
             # Labeled facts anchor: use GT confidence directly
