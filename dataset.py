@@ -63,10 +63,11 @@ class UKGDataset:
     def _load_file(self, filepath_prefix, is_inc):
         """自动适配 .txt 或 .tsv 后缀。
         
-        对于增量训练文件 (is_inc=True, 含 'train')，支持混合格式：
+        对于增量文件 (is_inc=True)，支持混合格式：
           - 4列行 h\tr\tt\tconf：有标注事实，置信度已知
           - 3列行 h\tr\tt：无标注事实，置信度未知 (第4元素存为 None)
-        非增量文件及验证/测试文件仍要求 4 列。
+        非增量文件 (base) 仍要求 4 列。
+        belief_state 仅在增量训练文件中由有标注事实填充。
         """
         triplets = []
         filepath = None
@@ -107,8 +108,8 @@ class UKGDataset:
                         self.belief_state[(h_id, r_id, t_id)] = c_val
                         self.belief_state[(t_id, r_inv_id, h_id)] = c_val
 
-                elif len(parts) == 3 and is_inc and is_train:
-                    # 无标注的增量训练事实：置信度未知，用 None 标记
+                elif len(parts) == 3 and is_inc:
+                    # 无标注的增量事实：置信度未知，用 None 标记
                     h_id = self._get_ent_id(parts[0], is_inc)
                     r_id = self._get_rel_id(parts[1])
                     t_id = self._get_ent_id(parts[2], is_inc)
