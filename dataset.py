@@ -27,7 +27,11 @@ class UKGDataset:
         self.inc_train = self._load_file(os.path.join(data_dir, "inc", "train"), is_inc=True)
         self.inc_valid = self._load_file(os.path.join(data_dir, "inc", "valid"), is_inc=True)
         self.inc_test  = self._load_file(os.path.join(data_dir, "inc", "test"),  is_inc=True)
-        print(f"Inc 阶段加载完成: 发现新实体数={len(self.new_entities)}")
+        # 布尔掩码：标记 inc_train 中哪些事实有已知置信度（第4元素不为 None）
+        self.inc_labeled_mask = [f[3] is not None for f in self.inc_train]
+        labeled_count = sum(self.inc_labeled_mask)
+        print(f"Inc 阶段加载完成: 发现新实体数={len(self.new_entities)}, "
+              f"有标注事实={labeled_count}/{len(self.inc_train)}")
 
     def _get_ent_id(self, ent, is_inc):
         if ent not in self.ent2id:
@@ -57,7 +61,13 @@ class UKGDataset:
         return self.rel2id[rel]
 
     def _load_file(self, filepath_prefix, is_inc):
-        """自动适配 .txt 或 .tsv 后缀"""
+        """自动适配 .txt 或 .tsv 后缀。
+        
+        对于增量训练文件 (is_inc=True, 含 'train')，支持混合格式：
+          - 4列行 h\tr\tt\tconf：有标注事实，置信度已知
+          - 3列行 h\tr\tt：无标注事实，置信度未知 (第4元素存为 None)
+        非增量文件及验证/测试文件仍要求 4 列。
+        """
         triplets = []
         filepath = None
         
@@ -69,7 +79,7 @@ class UKGDataset:
             print(f"警告: 找不到文件 {filepath_prefix}.txt 或 .tsv")
             return triplets
             
-        # 【新增】：判断当前读的是不是训练集
+        # 判断当前读的是不是训练集
         is_train = "train" in filepath_prefix
             
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -96,6 +106,21 @@ class UKGDataset:
                         # 记忆库也应该双向保存，保证状态一致性
                         self.belief_state[(h_id, r_id, t_id)] = c_val
                         self.belief_state[(t_id, r_inv_id, h_id)] = c_val
+
+                elif len(parts) == 3 and is_inc and is_train:
+                    # 无标注的增量训练事实：置信度未知，用 None 标记
+                    h_id = self._get_ent_id(parts[0], is_inc)
+                    r_id = self._get_rel_id(parts[1])
+                    t_id = self._get_ent_id(parts[2], is_inc)
+
+                    # 1. 加入正向边 (conf=None 表示无标注)
+                    triplets.append((h_id, r_id, t_id, None))
+
+                    # 2. 加入反向边
+                    r_inv_id = r_id + 1
+                    triplets.append((t_id, r_inv_id, h_id, None))
+
+                    # 不写入 belief_state，等 updater 预测后再填充
                         
         return triplets
 
@@ -119,5 +144,11 @@ class UKGDataset:
         self.belief_state[fact_tuple] = new_confidence
 
     def get_incremental_batches(self, batch_size=1024):
+        """产出增量训练事实的批次。
+        
+        每个元素为 (h, r, t, conf_or_None)，其中：
+          - conf_or_None 为 float 时表示该事实有已知置信度（有标注）
+          - conf_or_None 为 None 时表示该事实无标注，置信度需由模型预测
+        """
         for i in range(0, len(self.inc_train), batch_size):
             yield self.inc_train[i:i + batch_size]
