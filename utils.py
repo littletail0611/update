@@ -29,16 +29,22 @@ def evaluate_model(model, test_data, z, device="cpu"):
     """
     在给定的测试集上评估模型
     加入了参数 z: 必须传入经过 GNN 聚合后的实体特征，而不是原始 Embedding！
+    只评估有已知置信度（第4个元素不为 None）的事实。
     """
     if not test_data:
         return calculate_metrics([], [])
-        
+
+    # 过滤掉无标注事实（置信度为 None）
+    labeled_data = [fact for fact in test_data if fact[3] is not None]
+    if not labeled_data:
+        return calculate_metrics([], [])
+
     model.eval() 
     
-    h_idx = torch.tensor([fact[0] for fact in test_data], dtype=torch.long).to(device)
-    r_idx = torch.tensor([fact[1] for fact in test_data], dtype=torch.long).to(device)
-    t_idx = torch.tensor([fact[2] for fact in test_data], dtype=torch.long).to(device)
-    y_true = torch.tensor([fact[3] for fact in test_data], dtype=torch.float) 
+    h_idx = torch.tensor([fact[0] for fact in labeled_data], dtype=torch.long).to(device)
+    r_idx = torch.tensor([fact[1] for fact in labeled_data], dtype=torch.long).to(device)
+    t_idx = torch.tensor([fact[2] for fact in labeled_data], dtype=torch.long).to(device)
+    y_true = torch.tensor([fact[3] for fact in labeled_data], dtype=torch.float) 
     
     with torch.no_grad():
         # 【核心修复】：使用传入的 GNN 聚合特征 z，而不是 model.entity_emb
