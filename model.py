@@ -110,32 +110,32 @@ class HeteroscedasticBaseModel(nn.Module):
         reg_term = 0.5 * torch.log(sigma_sq + eps)
         return torch.mean(mse_term + reg_term)
 
-    def continuous_contrastive_loss(self, z_h, r_id, z_t, labels, temperature=0.07):
-        """优化版：带有硬性截断和更低温度系数的对比损失"""
-        r_features = self.relation_emb(r_id)
-        z_hrt = z_h + r_features + z_t 
+    # def continuous_contrastive_loss(self, z_h, r_id, z_t, labels, temperature=0.07):
+    #     """优化版：带有硬性截断和更低温度系数的对比损失"""
+    #     r_features = self.relation_emb(r_id)
+    #     z_hrt = z_h + r_features + z_t 
         
-        z_hrt = F.normalize(z_hrt, p=2, dim=1)
-        feat_sim = torch.matmul(z_hrt, z_hrt.T) / temperature
+    #     z_hrt = F.normalize(z_hrt, p=2, dim=1)
+    #     feat_sim = torch.matmul(z_hrt, z_hrt.T) / temperature
         
-        labels = labels.unsqueeze(1)
-        label_diff = torch.abs(labels - labels.T)
+    #     labels = labels.unsqueeze(1)
+    #     label_diff = torch.abs(labels - labels.T)
         
-        # 【优化】：使用更尖锐的高斯核带宽，并引入阈值截断
-        # 只有置信度差异小于 0.2 的才被视为正样本(互相拉近)
-        label_weight = torch.exp(- (label_diff ** 2) / 0.05)
-        label_weight[label_diff > 0.2] = 0.0  # 硬性推远差异大的样本
+    #     # 【优化】：使用更尖锐的高斯核带宽，并引入阈值截断
+    #     # 只有置信度差异小于 0.2 的才被视为正样本(互相拉近)
+    #     label_weight = torch.exp(- (label_diff ** 2) / 0.05)
+    #     label_weight[label_diff > 0.1] = 0.0  # 硬性推远差异大的样本
         
-        mask = torch.eye(labels.shape[0], dtype=torch.bool, device=labels.device)
-        label_weight.masked_fill_(mask, 0.0)
+    #     mask = torch.eye(labels.shape[0], dtype=torch.bool, device=labels.device)
+    #     label_weight.masked_fill_(mask, 0.0)
         
-        num = torch.sum(label_weight * torch.exp(feat_sim), dim=1)
-        den = torch.sum(torch.exp(feat_sim) * (~mask), dim=1)
+    #     num = torch.sum(label_weight * torch.exp(feat_sim), dim=1)
+    #     den = torch.sum(torch.exp(feat_sim) * (~mask), dim=1)
         
-        # 过滤掉 num 为 0 的异常样本，防止 log(0)
-        valid_mask = num > 1e-6
-        if not valid_mask.any():
-            return torch.tensor(0.0, device=labels.device, requires_grad=True)
+    #     # 过滤掉 num 为 0 的异常样本，防止 log(0)
+    #     valid_mask = num > 1e-6
+    #     if not valid_mask.any():
+    #         return torch.tensor(0.0, device=labels.device, requires_grad=True)
             
-        loss_cl = -torch.log(num[valid_mask] / (den[valid_mask] + 1e-8)).mean()
-        return loss_cl
+    #     loss_cl = -torch.log(num[valid_mask] / (den[valid_mask] + 1e-8)).mean()
+    #     return loss_cl
