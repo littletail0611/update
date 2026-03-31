@@ -47,7 +47,38 @@ def get_args(argv=None):
     parser.add_argument("--lambda_reg", type=float, default=0.001, help="受影响旧实体的 L2 正则化权重")
     parser.add_argument("--func_anchor_ratio", type=float, default=0.9, help="功能性锚定损失的混合比例")
 
-    # ================= 5. 调参模式 =================
+    # ================= 5. 基线模型超参数 =================
+    # [EWC]
+    parser.add_argument("--ewc_lambda", type=float, default=5000.0, help="EWC 正则化强度 λ")
+    parser.add_argument("--ewc_fisher_samples", type=int, default=1024, help="计算 Fisher 信息矩阵时采样的 Base 事实数量")
+
+    # [SI]
+    parser.add_argument("--si_c", type=float, default=0.1, help="SI 替代损失的正则化强度 c")
+    parser.add_argument("--si_epsilon", type=float, default=0.1, help="SI 重要性权重归一化的平滑项 ε")
+
+    # [GEM]
+    parser.add_argument("--gem_memory_size", type=int, default=256, help="GEM 情景记忆缓冲区大小 (base 事实数)")
+    parser.add_argument("--gem_margin", type=float, default=0.5, help="GEM 梯度投影的松弛边距 γ")
+
+    # [EMR]
+    parser.add_argument("--emr_memory_size", type=int, default=256, help="EMR 嵌入记忆回放的缓冲区大小")
+    parser.add_argument("--emr_align_coeff", type=float, default=0.1, help="EMR 嵌入对齐损失的权重系数")
+
+    # [CWR]
+    parser.add_argument("--cwr_replay_size", type=int, default=256, help="CWR 回放缓冲区大小 (base 事实数)")
+    parser.add_argument("--cwr_alpha", type=float, default=0.5, help="CWR 当前任务权重与 base 快照的混合比例")
+
+    # [PNN]
+    parser.add_argument("--pnn_adapter_dim", type=int, default=32, help="PNN 横向适配器的隐层维度")
+
+    # [DiCGRL]
+    parser.add_argument("--dicgrl_num_subspaces", type=int, default=4, help="DiCGRL 解耦子空间数量 K")
+    parser.add_argument("--dicgrl_consolidation_coeff", type=float, default=0.1, help="DiCGRL 非活跃子空间的知识巩固损失权重")
+
+    # [通用基线微调步数]
+    parser.add_argument("--baseline_steps", type=int, default=100, help="基线模型增量微调步数")
+
+    # ================= 7. 调参模式 =================
     parser.add_argument("--tuning_mode", action="store_true", default=False, help="启用调参模式 (抑制控制台冗余输出)")
 
     args = parser.parse_args(argv)
