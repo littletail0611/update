@@ -53,7 +53,7 @@ def train_base(args):
         # 随机打乱边的索引
         perm = torch.randperm(num_edges, device=args.device)
         epoch_loss_conf = 0
-        epoch_loss_cl = 0
+        # epoch_loss_cl = 0
         
         # 遍历各个 Batch
         for i in range(0, num_edges, args.base_batch_size):
@@ -91,21 +91,22 @@ def train_base(args):
             loss_conf = model.heteroscedastic_loss(mu, sigma_sq, b_conf)
             
             # 2. 连续标签感知的对比学习损失
-            loss_cl = model.continuous_contrastive_loss(b_h, b_r, b_t, b_conf)
+            # loss_cl = model.continuous_contrastive_loss(b_h, b_r, b_t, b_conf)
             
             # 3. 联合优化
-            loss = loss_conf + args.alpha_cl * loss_cl
+            # loss = loss_conf + args.alpha_cl * loss_cl
+            loss = loss_conf
             loss.backward()
             optimizer.step()
             
             epoch_loss_conf += loss_conf.item()
-            epoch_loss_cl += loss_cl.item()
+            # epoch_loss_cl += loss_cl.item()
     
         # 每 2 个 Epoch 评估一次验证集，执行早停判定
-        if (epoch + 1) % 2 == 0:
+        if (epoch + 1) % 1 == 0:
             num_batches = (num_edges // args.base_batch_size) + 1
             avg_conf_loss = epoch_loss_conf / num_batches
-            avg_cl_loss = epoch_loss_cl / num_batches
+            # avg_cl_loss = epoch_loss_cl / num_batches
             
             # 注意：传入评估需要用全局最优的 z，所以在 eval 前重新过一次全图
             model.eval()
@@ -116,7 +117,8 @@ def train_base(args):
             current_mse = valid_metrics['MSE']
             current_mae = valid_metrics['MAE']
             
-            print(f"Epoch [{epoch+1}/{args.base_epochs}] | L_conf: {avg_conf_loss:.4f} | L_cl: {avg_cl_loss:.4f} | Valid MSE: {current_mse:.4f} | Valid MAE: {current_mae:.4f}")
+            # print(f"Epoch [{epoch+1}/{args.base_epochs}] | L_conf: {avg_conf_loss:.4f} | L_cl: {avg_cl_loss:.4f} | Valid MSE: {current_mse:.4f} | Valid MAE: {current_mae:.4f}")
+            print(f"Epoch [{epoch+1}/{args.base_epochs}] | L_conf: {avg_conf_loss:.4f} | Valid MSE: {current_mse:.4f} | Valid MAE: {current_mae:.4f}")
             
             # 早停机制
             if current_mse < best_valid_mse:
@@ -127,7 +129,7 @@ def train_base(args):
             else:
                 patience_counter += 1
                 if patience_counter >= args.patience:
-                    print(f"\n触发早停 (Early Stopping)! 验证集已连续 {args.patience * 2} 轮未提升。")
+                    print(f"\n触发早停 (Early Stopping)! 验证集已连续 {args.patience} 轮未提升。")
                     break
 
     # 4. 最终测试集评估
