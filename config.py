@@ -17,39 +17,38 @@ def get_args(argv=None):
     # ================= 3. Base 模型离线训练参数 =================
     parser.add_argument("--base_epochs", type=int, default=200, help="Base 模型最大训练轮数")
     parser.add_argument("--base_lr", type=float, default=0.001, help="Base 模型学习率")
-    parser.add_argument("--base_weight_decay", type=float, default=1e-4, help="L2 正则化权重 (防过拟合)")
-    parser.add_argument("--base_batch_size", type=int, default=2048, help="Base 模型 Mini-batch 边采样大小")
-    parser.add_argument("--alpha_cl", type=float, default=0.5, help="连续对比学习损失的权重")
-    parser.add_argument("--patience", type=int, default=10, help="早停机制：容忍多少次验证集评估不下降")
+    parser.add_argument("--base_weight_decay", type=float, default=1e-4, help="L2 正则化权重")
+    parser.add_argument("--base_batch_size", type=int, default=2048, help="Base 模型 Batch 大小")
+    parser.add_argument("--alpha_cl", type=float, default=0.5, help="对比学习损失的权重")
+    parser.add_argument("--patience", type=int, default=10, help="早停机制容忍次数")
     
-    # ================= 4. 增量更新 (Online Updating) 核心数学参数 =================
-    parser.add_argument("--inc_batch_size", type=int, default=1024, help="流式处理新事实的 Batch 大小")
-    parser.add_argument("--single_batch", action="store_true", default=True,
-                        help="Process all incremental facts in a single batch (one-shot update). "
-                             "Set --no-single_batch for streaming/continual mode.")
+    # ================= 4. 增量更新 (Online Updating) 参数 =================
+    # [通用控制]
+    parser.add_argument("--inc_batch_size", type=int, default=1024, help="处理新事实的 Batch 大小")
+    parser.add_argument("--single_batch", action="store_true", default=True, help="是否将所有增量事实作为一个 Batch 一次性更新")
     parser.add_argument("--no-single_batch", dest="single_batch", action="store_false")
-    parser.add_argument("--inc_lr", type=float, default=0.005, help="局部 EM 和微调时的学习率")
-    parser.add_argument("--em_steps", type=int, default=15, help="局部 EM 推断的交替迭代次数")
-    parser.add_argument("--gamma", type=float, default=0.8, help="因果影响多跳传播的衰减因子")
-    parser.add_argument("--num_hops", type=int, default=2, help="因果影响传播的最大跳数")
-    parser.add_argument("--epsilon", type=float, default=1e-4, help="贝叶斯滤波中防止除零的平滑项")
-    parser.add_argument("--influence_threshold", type=float, default=0.02, help="判定旧事实受影响的阈值")
-    parser.add_argument("--lambda_reg", type=float, default=0.1, help="防止灾难性遗忘的锚点正则化权重")
-    parser.add_argument("--refine_steps", type=int, default=10, help="受影响局部子图的微调步数")
+    parser.add_argument("--inc_lr", type=float, default=0.005, help="增量更新器 (Updater) 的学习率")
+    parser.add_argument("--mlp_anchor_coeff", type=float, default=0.01, help="全局预测头(MLP)的正则化系数，防止全局预测能力崩溃")
 
-    # ================= 5. 传播-微调超参数 =================
-    parser.add_argument("--edge_drop_rate", type=float, default=0.2, help="Edge dropout ratio (deprecated: kept for backward compatibility, no longer used)")
-    parser.add_argument("--alpha_base", type=float, default=1.0, help="Weight for base outer-constraint loss")
-    parser.add_argument("--mlp_anchor_coeff", type=float, default=0.01, help="MLP anchor regularization coefficient")
-    parser.add_argument("--finetune_steps", type=int, default=5, help="Fine-tuning steps in propagate-then-finetune stage")
-    parser.add_argument("--propagation_hops", type=int, default=2, help="Number of hops for label propagation")
-    parser.add_argument("--dynamic_update_interval", type=int, default=2, help="Update pseudo-label every N finetune steps (0 to disable)")
-    parser.add_argument("--func_anchor_ratio", type=float, default=0.9, help="Blend ratio for functional anchoring: func_anchor_ratio * functional_loss + (1 - func_anchor_ratio) * weak_absolute_L2")
-    parser.add_argument("--alpha_new_supervision", type=float, default=0.3,
-                        help="Weight for new-fact pseudo-label supervision in fine-tuning")
+    # [Stage 1: 先立锚再扩散 (Propagate & Finetune)]
+    parser.add_argument("--anchor_steps", type=int, default=100, help="Sub-stage 1.1: 纯有标签数据的立锚微调步数")
+    parser.add_argument("--finetune_steps", type=int, default=50, help="Sub-stage 1.2: 引入无标签数据的扩散微调步数")
+    parser.add_argument("--lambda_ent_reg", type=float, default=1.0, help="立锚期防止新实体表征坍塌的空间正则化权重")
+    parser.add_argument("--alpha_labeled_supervision", type=float, default=1.0, help="有标签数据的监督权重")
+    parser.add_argument("--alpha_new_supervision", type=float, default=3.0, help="无标签伪标签数据的监督权重")
+    parser.add_argument("--dynamic_update_interval", type=int, default=5, help="扩散期更新伪标签的频率(步数)")
 
-    # ================= 6. 调参模式 =================
-    parser.add_argument("--tuning_mode", action="store_true", default=False, help="Enable tuning mode: suppresses verbose console output during hyperparameter search")
+    # [Stage 2: 局部因果推断与贝叶斯精炼 (Causal & Refinement)]
+    parser.add_argument("--causal_num_hops", type=int, default=2, help="因果影响评估截取的局部子图跳数 (K-hop)")
+    parser.add_argument("--gamma", type=float, default=0.8, help="因果影响计算中的全局衰减因子")
+    parser.add_argument("--epsilon", type=float, default=1e-4, help="贝叶斯滤波防除零的平滑项")
+    parser.add_argument("--influence_threshold", type=float, default=0.005, help="判定旧事实受因果影响的阈值")
+    parser.add_argument("--refine_steps", type=int, default=3, help="受影响局部子图的联合微调步数")
+    parser.add_argument("--lambda_reg", type=float, default=0.001, help="受影响旧实体的 L2 正则化权重")
+    parser.add_argument("--func_anchor_ratio", type=float, default=0.9, help="功能性锚定损失的混合比例")
+
+    # ================= 5. 调参模式 =================
+    parser.add_argument("--tuning_mode", action="store_true", default=False, help="启用调参模式 (抑制控制台冗余输出)")
 
     args = parser.parse_args(argv)
     return args
